@@ -35,7 +35,7 @@ class TraktSync(_PluginBase):
 
     plugin_desc = "同步Trakt的watch list并添加订阅"
 
-    plugin_icon = "https://trakt.tv/assets/logos/logomark.square.gradient-b644b16c38ff775861b4b1f58c1230f6a097a2466ab33ae00445a505c33fcb91.svg"
+    plugin_icon = "trakt.svg"
 
     plugin_author = "cyt-666"
 
