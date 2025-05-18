@@ -35,7 +35,7 @@ class TraktSync(_PluginBase):
 
     plugin_desc = "同步Trakt的watch list并添加订阅"
 
-    plugin_icon = "trakt.svg"
+    plugin_icon = "https://github.com/cyt-666/MoviePilot-Plugins/blob/main/icons/trakt.png"
 
     plugin_author = "cyt-666"
 
