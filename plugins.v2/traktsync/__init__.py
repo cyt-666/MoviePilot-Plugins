@@ -39,7 +39,7 @@ class TraktSync(_PluginBase):
 
     plugin_author = "cyt-666"
 
-    plugin_version = "0.1.5"
+    plugin_version = "0.1.6"
 
     author_url = "https://github.com/cyt-666"
 
@@ -593,7 +593,7 @@ class TraktSync(_PluginBase):
             return
         history = self.get_data("history")
         for item in watchlist:
-            not_in_no_exists = False
+            not_in_no_exists = True
             s_type = "movie"
             if item.get("type") != "movie":
                 s_type = "show"
@@ -636,7 +636,7 @@ class TraktSync(_PluginBase):
                                                                             lefts=no_exists)
                             logger.info(f'{mediainfo.title_year} 添加订阅成功')
                             action = "subscribe"
-                            not_in_no_exists = True
+                            not_in_no_exists = False
             else:
                 logger.error(f'{meta.title} 没有TMDB ID')
                 continue
