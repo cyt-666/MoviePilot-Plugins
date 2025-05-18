@@ -586,7 +586,9 @@ class TraktSync(_PluginBase):
             meta.type = MediaType.MOVIE if item.get("type") == "movie" else MediaType.TV
             if trakt_media_info.get("ids").get("tmdb") is not None:
                 mediainfo = self.chain.recognize_media(meta=meta, tmdbid=trakt_media_info.get("ids").get("tmdb"))
-                exist_flag = self.subscribechain.exists(mediainfo=mediainfo, meta=meta)
+                exist_flag, no_exists = self.downloadchain.get_no_exists_info(meta=meta, mediainfo=mediainfo)
+                if not exist_flag:
+                    exist_flag = self.subscribechain.exists(mediainfo=mediainfo, meta=meta)
                 if exist_flag:
                     logger.info(f'{mediainfo.title_year}已经被订阅')
                     action = "exist"
