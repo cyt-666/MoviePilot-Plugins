@@ -39,7 +39,7 @@ class TraktSync(_PluginBase):
 
     plugin_author = "cyt-666"
 
-    plugin_version = "0.1.2"
+    plugin_version = "0.1.3"
 
     author_url = "https://github.com/cyt-666"
 
@@ -591,21 +591,46 @@ class TraktSync(_PluginBase):
             return
         history = self.get_data("history")
         for item in watchlist:
-            trakt_media_info = item.get(item.get("type"))
+            s_type = "movie"
+            if item.get("type") != "movie":
+                s_type = "show"
+            else:
+                s_type = "movie"
+            trakt_media_info = item.get(s_type)
             meta = MetaInfo(title=trakt_media_info.get("title"))
-            meta.type = MediaType.MOVIE if item.get("type") == "movie" else MediaType.TV
+            meta.type = MediaType.MOVIE if s_type == "movie" else MediaType.TV
             if trakt_media_info.get("ids").get("tmdb") is not None:
                 mediainfo = self.chain.recognize_media(meta=meta, tmdbid=trakt_media_info.get("ids").get("tmdb"))
                 exist_flag, no_exists = self.downloadchain.get_no_exists_info(meta=meta, mediainfo=mediainfo)
-                if not exist_flag:
-                    exist_flag = self.subscribechain.exists(mediainfo=mediainfo, meta=meta)
                 if exist_flag:
                     logger.info(f'{mediainfo.title_year}已经被订阅')
                     action = "exist"
                 else:
-                    self.add_subscribe(mediainfo, meta, "trakt", "trakt_sync")
-                    action = "subscribe"
-                    logger.info(f'{mediainfo.title_year} 添加订阅成功')
+                    for no_exist in no_exists.values():
+                        for season in no_exist.keys():
+                            if item.get("type") == "episode" and season != item.get("episode").get("season"):
+                                continue
+                            if item.get("type") == "season" and season != item.get("season").get("number"):
+                                continue
+                            meta.begin_season = season
+                            exist_flag = self.subscribechain.exists(mediainfo=mediainfo, meta=meta)
+                            if exist_flag:
+                                logger.info(f'{mediainfo.title_year} 第{season}季 已经订阅')
+                                action = "exist"
+                                continue
+                            sub_id, message = self.add_subscribe_season(mediainfo, meta, "trakt", "trakt_sync")
+                            # 更新订阅信息
+                            logger.info(f'根据缺失剧集更新订阅信息 {mediainfo.title_year} ...')
+                            subscribe = self.subscribechain.subscribeoper.get(sub_id)
+                            if subscribe:
+                                self.subscribechain.finish_subscribe_or_not(subscribe=subscribe,
+                                                                            meta=meta,
+                                                                            mediainfo=mediainfo,
+                                                                            downloads=[],
+                                                                            lefts=no_exists)
+                            logger.info(f'{mediainfo.title_year} 添加订阅成功')
+                            action = "subscribe"
+                            
             else:
                 logger.error(f'{meta.title} 没有TMDB ID')
                 continue
@@ -623,7 +648,7 @@ class TraktSync(_PluginBase):
             }
         self.save_data("history", history)
     
-    def add_subscribe(self, mediainfo, meta, nickname, real_name):
+    def add_subscribe_season(self, mediainfo, meta, nickname, real_name):
         return self.subscribechain.add(
             title=mediainfo.title,
             year=mediainfo.year,
@@ -631,6 +656,17 @@ class TraktSync(_PluginBase):
             tmdbid=mediainfo.tmdb_id,
             season=meta.begin_season,
             exist_ok=True,
+            username=real_name or f"Trakt Sync Plugin"
+        )
+    def add_subscribe_episode(self, mediainfo, season, episodes, nickname, real_name):
+        return self.subscribechain.add(
+            title=mediainfo.title,
+            year=mediainfo.year,
+            mtype=mediainfo.type,
+            tmdbid=mediainfo.tmdb_id,
+            season=season,
+            exist_ok=True,
+            episode_group=episodes,
             username=real_name or f"Trakt Sync Plugin"
         )
     def get_service(self) -> List[Dict[str, Any]]:
