@@ -26,3 +26,6 @@ MoviePilot插件市场：https://github.com/cyt-666/MoviePilot-Plugins
 
 点击保存
 
+
+然后去插件日志里找认证链接和认证code完成与自己的trakt账户的绑定即可。
+
