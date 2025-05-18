@@ -3,7 +3,7 @@ import requests
 import json
 import time
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Thread
 from typing import Optional, Any, List, Dict, Tuple
 
 import pytz
@@ -39,7 +39,7 @@ class TraktSync(_PluginBase):
 
     plugin_author = "cyt-666"
 
-    plugin_version = "0.1.1"
+    plugin_version = "0.1.2"
 
     author_url = "https://github.com/cyt-666"
 
@@ -83,6 +83,19 @@ class TraktSync(_PluginBase):
 
     _media_type: str = ""
 
+    def _threaded_token_request(self, device_code: str, interval: int, count: int):
+        """
+        在单独的线程中请求 Trakt token。
+        """
+        for i in range(int(count)):
+            time.sleep(interval)
+            self.token = self.token_request(device_code)
+            if self.token:
+                logger.info("Trakt token acquired successfully in thread.")
+                break
+        if not self.token:
+            logger.error("Trakt token request failed in thread.")
+
     def init_plugin(self, config: dict = None):
 
         self.downloadchain = DownloadChain()
@@ -118,15 +131,12 @@ class TraktSync(_PluginBase):
                 device_code = code.get("device_code")
                 verification_url = code.get("verification_url")
                 logger.info(f"Please visit {verification_url} to authorize the app, use code {user_code} in {expires_in} seconds")
-                for i in range(int(count)):
-                    time.sleep(interval)
-                    self.token = self.token_request(device_code)
-                    if self.token:
-                        break
-                if not self.token:
-                    logger.error("Trakt token request failed")
-                    return
-
+                
+                # 创建并启动线程
+                token_thread = Thread(target=self._threaded_token_request, args=(device_code, interval, count))
+                token_thread.daemon = True # 设置为守护线程，主程序退出时线程也会退出
+                token_thread.start()
+                logger.info("Trakt token acquisition started in a separate thread.")
 
             if self._enabled or self._onlyonce:
                 if self._onlyonce:
