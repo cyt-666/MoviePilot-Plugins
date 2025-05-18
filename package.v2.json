@@ -3,11 +3,12 @@
         "name": "Trakt WatchList 同步",
         "description": "Trakt WatchList 同步",
         "labels": "Trakt,WatchList,同步",
-        "version": "0.1.4",
+        "version": "0.1.5",
         "icon": "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/trakt.png",
         "author": "cyt-666",
         "level": 2,
         "history": {
+            "v0.1.5": "修复已入库剧集不在history中显示的问题",
             "v0.1.4": "跳过历史记录中存在的剧集，历史记录单季订阅显示季度信息",
             "v0.1.3": "修复了订阅不准确的问题",
             "v0.1.2": "修复了token获取token会导致保存设置阻塞的问题",
