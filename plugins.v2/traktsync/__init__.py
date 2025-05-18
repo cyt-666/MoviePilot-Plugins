@@ -39,7 +39,7 @@ class TraktSync(_PluginBase):
 
     plugin_author = "cyt-666"
 
-    plugin_version = "0.1.0"
+    plugin_version = "0.1.1"
 
     author_url = "https://github.com/cyt-666"
 
