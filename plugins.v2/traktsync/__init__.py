@@ -39,7 +39,7 @@ class TraktSync(_PluginBase):
 
     plugin_author = "cyt-666"
 
-    plugin_version = "0.1.3"
+    plugin_version = "0.1.4"
 
     author_url = "https://github.com/cyt-666"
 
@@ -199,6 +199,8 @@ class TraktSync(_PluginBase):
         for history in historys:
             id = history.get("id")
             title = history.get("title")
+            if "season" in history.keys():
+                title = f"{title} 第{history.get('season')}季"
             poster = history.get("poster")
             mtype = history.get("type")
             time_str = history.get("time")
@@ -597,6 +599,9 @@ class TraktSync(_PluginBase):
             else:
                 s_type = "movie"
             trakt_media_info = item.get(s_type)
+            if str(item.get("id")) in history.keys():
+                logger.info(f'{trakt_media_info.get("title")} 已经同步过，直接跳过')
+                continue
             meta = MetaInfo(title=trakt_media_info.get("title"))
             meta.type = MediaType.MOVIE if s_type == "movie" else MediaType.TV
             if trakt_media_info.get("ids").get("tmdb") is not None:
@@ -636,7 +641,7 @@ class TraktSync(_PluginBase):
                 continue
             if not history:
                 history = {}
-            history[item.get("id")] = {
+            tmp = {
                 "title": mediainfo.title_year,
                 "type": mediainfo.type.value,
                 "year": mediainfo.year,
@@ -646,6 +651,12 @@ class TraktSync(_PluginBase):
                 "action": action,
                 "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             }
+            if item.get("type") == "episode":
+                tmp["season"] = item.get("episode").get("season")
+            if item.get("type") == "season":
+                tmp["season"] = item.get("season").get("number")
+
+            history[item.get("id")] = tmp
         self.save_data("history", history)
     
     def add_subscribe_season(self, mediainfo, meta, nickname, real_name):
