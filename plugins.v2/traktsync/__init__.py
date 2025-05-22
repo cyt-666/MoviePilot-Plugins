@@ -39,7 +39,7 @@ class TraktSync(_PluginBase):
 
     plugin_author = "cyt-666"
 
-    plugin_version = "0.1.7"
+    plugin_version = "0.1.8"
 
     author_url = "https://github.com/cyt-666"
 
@@ -618,7 +618,7 @@ class TraktSync(_PluginBase):
                             logger.info(f'{mediainfo.title_year} 已经订阅')
                             action = "exist"
                             continue
-                        sub_id, message = self.add_subscribe_movie(mediainfo, meta, "trakt", "trakt_sync")
+                        sub_id, message = self.add_subscribe_season(mediainfo, meta, "trakt", "trakt_sync")
                         subscribe = self.subscribechain.subscribeoper.get(sub_id)
                         if subscribe:
                             self.subscribechain.finish_subscribe_or_not(subscribe=subscribe,
