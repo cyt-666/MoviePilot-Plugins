@@ -39,7 +39,7 @@ class TraktSync(_PluginBase):
 
     plugin_author = "cyt-666"
 
-    plugin_version = "0.1.6"
+    plugin_version = "0.1.7"
 
     author_url = "https://github.com/cyt-666"
 
@@ -612,31 +612,48 @@ class TraktSync(_PluginBase):
                     logger.info(f'{mediainfo.title_year}已经被订阅')
                     action = "exist"
                 else:
-                    for no_exist in no_exists.values():
-                        for season in no_exist.keys():
-                            if item.get("type") == "episode" and season != item.get("episode").get("season"):
-                                continue
-                            if item.get("type") == "season" and season != item.get("season").get("number"):
-                                continue
-                            meta.begin_season = season
-                            exist_flag = self.subscribechain.exists(mediainfo=mediainfo, meta=meta)
-                            if exist_flag:
-                                logger.info(f'{mediainfo.title_year} 第{season}季 已经订阅')
-                                action = "exist"
-                                continue
-                            sub_id, message = self.add_subscribe_season(mediainfo, meta, "trakt", "trakt_sync")
-                            # 更新订阅信息
-                            logger.info(f'根据缺失剧集更新订阅信息 {mediainfo.title_year} ...')
-                            subscribe = self.subscribechain.subscribeoper.get(sub_id)
-                            if subscribe:
-                                self.subscribechain.finish_subscribe_or_not(subscribe=subscribe,
-                                                                            meta=meta,
-                                                                            mediainfo=mediainfo,
-                                                                            downloads=[],
-                                                                            lefts=no_exists)
-                            logger.info(f'{mediainfo.title_year} 添加订阅成功')
-                            action = "subscribe"
-                            not_in_no_exists = False
+                    if meta.type == MediaType.MOVIE:
+                        exist_flag = self.subscribechain.exists(mediainfo=mediainfo, meta=meta)
+                        if exist_flag:
+                            logger.info(f'{mediainfo.title_year} 已经订阅')
+                            action = "exist"
+                            continue
+                        sub_id, message = self.add_subscribe_movie(mediainfo, meta, "trakt", "trakt_sync")
+                        subscribe = self.subscribechain.subscribeoper.get(sub_id)
+                        if subscribe:
+                            self.subscribechain.finish_subscribe_or_not(subscribe=subscribe,
+                                                                        meta=meta,
+                                                                        mediainfo=mediainfo,
+                                                                        downloads=[],
+                                                                        lefts=no_exists)
+                        logger.info(f'{mediainfo.title_year} 添加订阅成功')
+                        action = "subscribe"
+                    else:
+                        for no_exist in no_exists.values():
+                            for season in no_exist.keys():
+                                if item.get("type") == "episode" and season != item.get("episode").get("season"):
+                                    continue
+                                if item.get("type") == "season" and season != item.get("season").get("number"):
+                                    continue
+                                meta.begin_season = season
+                                exist_flag = self.subscribechain.exists(mediainfo=mediainfo, meta=meta)
+                                if exist_flag:
+                                    logger.info(f'{mediainfo.title_year} 第{season}季 已经订阅')
+                                    action = "exist"
+                                    continue
+                                sub_id, message = self.add_subscribe_season(mediainfo, meta, "trakt", "trakt_sync")
+                                # 更新订阅信息
+                                logger.info(f'根据缺失剧集更新订阅信息 {mediainfo.title_year} ...')
+                                subscribe = self.subscribechain.subscribeoper.get(sub_id)
+                                if subscribe:
+                                    self.subscribechain.finish_subscribe_or_not(subscribe=subscribe,
+                                                                                meta=meta,
+                                                                                mediainfo=mediainfo,
+                                                                                downloads=[],
+                                                                                lefts=no_exists)
+                                logger.info(f'{mediainfo.title_year} 添加订阅成功')
+                                action = "subscribe"
+                                not_in_no_exists = False
             else:
                 logger.error(f'{meta.title} 没有TMDB ID')
                 continue
