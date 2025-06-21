@@ -645,7 +645,7 @@ class TraktSync(_PluginBase):
                                 sub_id, message = self.add_subscribe_season(mediainfo, meta, "trakt", "trakt_sync")
                                 # 更新订阅信息
                                 logger.info(f'根据缺失剧集更新订阅信息 {mediainfo.title_year} ...')
-                                subscribe = self.subscribechain.subscribeoper.get(sub_id)
+                                subscribe = SubscribeOper().get(sub_id)
                                 if subscribe:
                                     self.subscribechain.finish_subscribe_or_not(subscribe=subscribe,
                                                                                 meta=meta,
