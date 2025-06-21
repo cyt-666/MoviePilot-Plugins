@@ -18,6 +18,7 @@ from app.schemas.types import MediaType, EventType, SystemConfigKey
 from app.chain.download import DownloadChain
 from app.chain.search import SearchChain
 from app.chain.subscribe import SubscribeChain
+from app.db.subscribe_oper import SubscribeOper
 from app.core.config import settings
 from app.core.event import Event
 from app.core.event import eventmanager
@@ -39,9 +40,9 @@ class TraktSync(_PluginBase):
 
     plugin_author = "cyt-666"
 
-    plugin_version = "0.1.8"
+    plugin_version = "0.1.9"
 
-    author_url = "https://github.com/cyt-666"
+    author_url = "https://github.com/cyt-666/MoviePilot-Plugins"
 
     plugin_config_prefix = "traktsync_"
 
@@ -619,7 +620,7 @@ class TraktSync(_PluginBase):
                             action = "exist"
                             continue
                         sub_id, message = self.add_subscribe_season(mediainfo, meta, "trakt", "trakt_sync")
-                        subscribe = self.subscribechain.subscribeoper.get(sub_id)
+                        subscribe = SubscribeOper().get(sub_id)
                         if subscribe:
                             self.subscribechain.finish_subscribe_or_not(subscribe=subscribe,
                                                                         meta=meta,
