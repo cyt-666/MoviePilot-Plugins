@@ -40,7 +40,7 @@ class TraktSync(_PluginBase):
 
     plugin_author = "cyt-666"
 
-    plugin_version = "0.1.9"
+    plugin_version = "0.2.0"
 
     author_url = "https://github.com/cyt-666/MoviePilot-Plugins"
 
