@@ -3,7 +3,7 @@
         "name": "Trakt WatchList 同步",
         "description": "Trakt WatchList 同步",
         "labels": "Trakt,WatchList,同步",
-        "version": "0.2.0",
+        "version": "0.2.1",
         "icon": "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/trakt.png",
         "author": "cyt-666",
         "level": 2,
