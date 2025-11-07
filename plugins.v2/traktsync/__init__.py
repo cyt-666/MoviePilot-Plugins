@@ -40,7 +40,7 @@ class TraktSync(_PluginBase):
 
     plugin_author = "cyt-666"
 
-    plugin_version = "0.2.0"
+    plugin_version = "0.2.1"
 
     author_url = "https://github.com/cyt-666/MoviePilot-Plugins"
 
@@ -588,10 +588,10 @@ class TraktSync(_PluginBase):
             logger.error("Trakt token refresh failed")
             return
         watchlist = self.get_watchlist(token.get("access_token"))
-        logger.info(f"Trakt get watchlist: {[w.get('id') for w in watchlist]}")
         if not watchlist:
             logger.error("Trakt get watchlist failed")
             return
+        logger.info(f"Trakt get watchlist: {[w.get('id') for w in watchlist]}")
         history = self.get_data("history")
         for item in watchlist:
             not_in_no_exists = True
@@ -601,7 +601,7 @@ class TraktSync(_PluginBase):
             else:
                 s_type = "movie"
             trakt_media_info = item.get(s_type)
-            if str(item.get("id")) in history.keys():
+            if history and str(item.get("id")) in history.keys():
                 logger.info(f'{trakt_media_info.get("title")} 已经同步过，直接跳过')
                 continue
             meta = MetaInfo(title=trakt_media_info.get("title"))
