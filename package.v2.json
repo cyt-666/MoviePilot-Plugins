@@ -22,7 +22,7 @@
             "v0.1.0": "Trakt WatchList 同步第一版"
         }
     },
-    "mediaservermsgaiwithdel": {
+    "mediamsgwithdeletemsg": {
         "name": "媒体库服务器通知AI版(支持删除消息)",
         "description": "媒体库服务器通知AI版的基础上加上媒体删除通知",
         "labels": "消息通知,媒体库",

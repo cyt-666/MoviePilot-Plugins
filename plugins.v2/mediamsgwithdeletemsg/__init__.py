@@ -207,6 +207,7 @@ class mediaservermsgai(_PluginBase):
             Tuple[List[dict], Dict[str, Any]]: 页面配置和默认数据
         """
         types_options = [
+            {"title": "删除媒体", "value": "library.deleted"},
             {"title": "新入库", "value": "library.new"},
             {"title": "开始播放", "value": "playback.start|media.play|PlaybackStart"},
             {"title": "停止播放", "value": "playback.stop|media.stop|PlaybackStop"},
