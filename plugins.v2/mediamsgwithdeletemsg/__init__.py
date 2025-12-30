@@ -51,7 +51,7 @@ class mediamsgwithdeletemsg(_PluginBase):
     plugin_name = "媒体库服务器通知AI版(支持删除消息)"
     plugin_desc = "基于Emby识别结果+TMDB元数据+微信清爽版(全消息类型+剧集聚合)"
     plugin_icon = "mediaplay.png"
-    plugin_version = "1.8.4"
+    plugin_version = "1.8.5"
     plugin_author = "jxxghp"
     author_url = "https://github.com/cyt-666/MoviePilot-Plugins"
     plugin_config_prefix = "mediamsgwithdeletemsg_"
@@ -476,6 +476,7 @@ class mediamsgwithdeletemsg(_PluginBase):
         if str(event_info.event) == "playback.unpause":
             if self._is_recent_event(event_key, self.DEFAULT_UNPAUSE_COOLDOWN):
                 logger.debug(f"过滤重复的unpause事件：{event_key}")
+                self._mark_recent_event(event_key, self.DEFAULT_UNPAUSE_COOLDOWN)
                 return
             self._mark_recent_event(event_key, self.DEFAULT_UNPAUSE_COOLDOWN)
         
