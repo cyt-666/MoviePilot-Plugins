@@ -537,9 +537,9 @@ class mediamsgwithdeletemsg(_PluginBase):
             if self._smart_category_enabled and tmdb_info:
                 try:
                     if event_info.item_type == "MOV":
-                        category = self.category.get_movie_category(tmdb_info)
+                        category = self.category.get_movie_category(tmdb_info.__dict__)
                     else:
-                        category = self.category.get_tv_category(tmdb_info)
+                        category = self.category.get_tv_category(tmdb_info.__dict__)
                 except Exception as e:
                     logger.debug(f"获取TMDB分类时出错: {str(e)}")
             
