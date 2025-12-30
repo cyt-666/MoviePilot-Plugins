@@ -40,7 +40,7 @@ class mediamsgwithdeletemsg(_PluginBase):
     plugin_name = "媒体库服务器通知AI版(支持删除消息)"
     plugin_desc = "基于Emby识别结果+TMDB元数据+微信清爽版(全消息类型+剧集聚合)"
     plugin_icon = "mediaplay.png"
-    plugin_version = "1.8.1"
+    plugin_version = "1.8.2"
     plugin_author = "jxxghp"
     author_url = "https://github.com/cyt-666/MoviePilot-Plugins"
     plugin_config_prefix = "mediamsgwithdeletemsg_"
@@ -517,11 +517,17 @@ class mediamsgwithdeletemsg(_PluginBase):
             if tmdb_id:
                 media_type_url = "movie" if event_info.item_type == "MOV" else "tv"
                 tmdb_url = f"https://www.themoviedb.org/{media_type_url}/{tmdb_id}"
-
-            if tmdb_url:
-                message_title = f"[{title_name}]({tmdb_url}) {action_text} {server_name}"
+            event_type = str(event_info.event).lower()
+            if event_type == "library.deleted":
+                if tmdb_url:
+                    message_title = f"[{title_name}]({tmdb_url}) 已从 {server_name} 中删除"
+                else:
+                    message_title = f"{title_name} {action_text} 已从 {server_name} 中删除"
             else:
-                message_title = f"{title_name} {action_text} {server_name}"
+                if tmdb_url:
+                    message_title = f"[{title_name}]({tmdb_url}) {action_text} {server_name}"
+                else:
+                    message_title = f"{title_name} {action_text} {server_name}"
 
             # 内容构造
             message_texts.append(f"⏰ {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}")
@@ -583,7 +589,6 @@ class mediamsgwithdeletemsg(_PluginBase):
             self._remove_key_cache(expiring_key)
 
         # 9. 发送
-        event_type = str(event_info.event).lower()
         if event_type != "library.deleted":
             self.post_message(
                 mtype=NotificationType.MediaServer,
