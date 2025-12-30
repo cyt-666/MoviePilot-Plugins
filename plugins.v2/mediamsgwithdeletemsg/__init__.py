@@ -40,7 +40,7 @@ class mediamsgwithdeletemsg(_PluginBase):
     plugin_name = "媒体库服务器通知AI版(支持删除消息)"
     plugin_desc = "基于Emby识别结果+TMDB元数据+微信清爽版(全消息类型+剧集聚合)"
     plugin_icon = "mediaplay.png"
-    plugin_version = "1.8.2"
+    plugin_version = "1.8.3"
     plugin_author = "jxxghp"
     author_url = "https://github.com/cyt-666/MoviePilot-Plugins"
     plugin_config_prefix = "mediamsgwithdeletemsg_"
@@ -693,7 +693,7 @@ class mediamsgwithdeletemsg(_PluginBase):
         category = None
         if self._smart_category_enabled and tmdb_info:
             try:
-                category = self.category.get_tv_category(tmdb_info)
+                category = self.category.get_tv_category(tmdb_info.__dict__)
             except Exception as e:
                 logger.debug(f"获取TMDB分类时出错: {str(e)}")
         
