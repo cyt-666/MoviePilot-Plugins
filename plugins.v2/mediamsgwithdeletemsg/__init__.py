@@ -43,7 +43,7 @@ class mediaservermsgai(_PluginBase):
     plugin_version = "1.8.1"
     plugin_author = "jxxghp"
     author_url = "https://github.com/cyt-666/MoviePilot-Plugins"
-    plugin_config_prefix = "mediaservermsgaiwithdel_"
+    plugin_config_prefix = "mediamsgwithdeletemsg_"
     plugin_order = 14
     auth_level = 1
 
