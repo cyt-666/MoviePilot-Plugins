@@ -18,6 +18,16 @@ from app.utils.web import WebUtils
 
 
 class mediamsgwithdeletemsg(_PluginBase):
+    def _event_core_fields(self, event_info):
+        """提取用于去重的核心字段"""
+        return (
+            getattr(event_info, "item_id", None),
+            getattr(event_info, "client", None),
+            getattr(event_info, "user_name", None),
+            getattr(event_info, "event", None),
+            getattr(event_info, "session_id", None)
+        )
+    
     """
     媒体服务器通知插件 AI增强版
 
@@ -35,12 +45,13 @@ class mediamsgwithdeletemsg(_PluginBase):
     DEFAULT_AGGREGATE_TIME = 15                # 默认聚合时间（秒）
     DEFAULT_OVERVIEW_MAX_LENGTH = 150          # 默认简介最大长度
     IMAGE_CACHE_MAX_SIZE = 100                 # 图片缓存最大数量
+    DEFAULT_UNPAUSE_COOLDOWN = 8               # Emby连续unpause事件去重窗口（秒）
 
     # ==================== 插件基本信息 ====================
     plugin_name = "媒体库服务器通知AI版(支持删除消息)"
     plugin_desc = "基于Emby识别结果+TMDB元数据+微信清爽版(全消息类型+剧集聚合)"
     plugin_icon = "mediaplay.png"
-    plugin_version = "1.8.3"
+    plugin_version = "1.8.4"
     plugin_author = "jxxghp"
     author_url = "https://github.com/cyt-666/MoviePilot-Plugins"
     plugin_config_prefix = "mediamsgwithdeletemsg_"
@@ -57,6 +68,7 @@ class mediamsgwithdeletemsg(_PluginBase):
     _last_event_cache: Tuple[Optional[Event], float] = (None, 0.0)  # 事件去重缓存
     _image_cache = {}                          # 图片URL缓存
     _overview_max_length = DEFAULT_OVERVIEW_MAX_LENGTH  # 简介最大长度
+    _recent_events = {}                        # 通用事件防抖缓存
 
     # ==================== TV剧集消息聚合配置 ====================
     _aggregate_enabled = False                 # 是否启用TV剧集聚合功能
@@ -454,16 +466,27 @@ class mediamsgwithdeletemsg(_PluginBase):
         self._clean_expired_cache()
         
         # 1. 防重复与防抖
-        expiring_key = f"{event_info.item_id}-{event_info.client}-{event_info.user_name}-{event_info.event}"
-        if str(event_info.event) == "playback.stop" and expiring_key in self._webhook_msg_keys:
-            self._add_key_cache(expiring_key)
+        session_key = self._build_event_key(event_info, include_event=False)
+        event_key = self._build_event_key(event_info, include_event=True)
+
+        if str(event_info.event) == "playback.stop" and session_key in self._webhook_msg_keys:
+            self._add_key_cache(session_key)
             return
+
+        if str(event_info.event) == "playback.unpause":
+            if self._is_recent_event(event_key, self.DEFAULT_UNPAUSE_COOLDOWN):
+                logger.debug(f"过滤重复的unpause事件：{event_key}")
+                return
+            self._mark_recent_event(event_key, self.DEFAULT_UNPAUSE_COOLDOWN)
         
         with self._lock:
             current_time = time.time()
             last_event, last_time = self._last_event_cache
             if last_event and (current_time - last_time < 2):
-                if last_event.event_id == event.event_id or last_event.event_data == event_info: 
+                # 只比对核心字段，忽略event_data中的动态内容
+                last_fields = self._event_core_fields(getattr(last_event, 'event_data', None)) if last_event else None
+                curr_fields = self._event_core_fields(event_info)
+                if last_event.event_id == event.event_id or (last_fields and last_fields == curr_fields):
                     return
             self._last_event_cache = (event, current_time)
 
@@ -584,9 +607,9 @@ class mediamsgwithdeletemsg(_PluginBase):
 
         # 8. 缓存管理（用于过滤重复停止事件）
         if str(event_info.event) == "playback.stop":
-            self._add_key_cache(expiring_key)
+            self._add_key_cache(session_key)
         if str(event_info.event) == "playback.start":
-            self._remove_key_cache(expiring_key)
+            self._remove_key_cache(session_key)
 
         # 9. 发送
         if event_type != "library.deleted":
@@ -1030,6 +1053,28 @@ class mediamsgwithdeletemsg(_PluginBase):
         expired_keys = [k for k, v in self._webhook_msg_keys.items() if v <= current_time]
         for key in expired_keys:
             self._webhook_msg_keys.pop(key, None)
+        expired_recent = [k for k, v in self._recent_events.items() if v <= current_time]
+        for key in expired_recent:
+            self._recent_events.pop(key, None)
+
+    def _build_event_key(self, event_info: WebhookEventInfo, include_event: bool = True) -> str:
+        session_id = getattr(event_info, "session_id", "") or ""
+        base_parts = [
+            str(event_info.item_id) if getattr(event_info, "item_id", None) else "",
+            str(event_info.client) if getattr(event_info, "client", None) else "",
+            str(event_info.user_name) if getattr(event_info, "user_name", None) else "",
+            session_id
+        ]
+        if include_event:
+            base_parts.append(str(event_info.event))
+        return "|".join(base_parts)
+
+    def _is_recent_event(self, key: str, cooldown: int) -> bool:
+        expire_at = self._recent_events.get(key)
+        return bool(expire_at and expire_at > time.time())
+
+    def _mark_recent_event(self, key: str, cooldown: int):
+        self._recent_events[key] = time.time() + cooldown
 
     @cached(
         region="MediaServerMsgAI",
