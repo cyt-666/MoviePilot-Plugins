@@ -85,7 +85,7 @@ class MoviePilotMCP(_PluginBase):
     plugin_name = "MoviePilot MCP Server"
     plugin_desc = "MoviePilot v2.10.4 的 ChatGPT 外部 MCP OAuth 包装层"
     plugin_icon = "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/moviepilotmcp.svg"
-    plugin_version = "0.3.4"
+    plugin_version = "0.3.5"
     plugin_author = "Codex"
     author_url = "https://wiki.movie-pilot.org/"
     plugin_config_prefix = "moviepilotmcp_"
@@ -176,6 +176,20 @@ class MoviePilotMCP(_PluginBase):
                 "methods": ["GET"],
                 "summary": "MoviePilot MCP OAuth authorization server metadata",
                 "description": "供 OAuth 客户端发现 MoviePilot MCP 授权服务器元数据（兼容路径）",
+                "allow_anonymous": True,
+            },
+            {
+                # VS Code MCP 客户端在 AS 元数据发现的 RFC 8414 path-insertion
+                # 和 OIDC path-insertion 两种方式都落在 {origin}/.well-known/... 根路径，
+                # 而 MoviePilot 插件只能托管在 /api/v1/plugin/<id>/ 前缀下，
+                # 唯一能被 VS Code 命中的是 OIDC path-addition:
+                # {issuer}/.well-known/openid-configuration
+                # 因此额外暴露一个 OIDC Discovery 端点，返回与 AS 元数据一致的内容。
+                "path": "/.well-known/openid-configuration",
+                "endpoint": self.handle_authorization_server_metadata,
+                "methods": ["GET"],
+                "summary": "MoviePilot MCP OpenID Connect discovery",
+                "description": "供 VS Code 等 MCP 客户端通过 OIDC path-addition 发现授权服务器元数据",
                 "allow_anonymous": True,
             },
             {
