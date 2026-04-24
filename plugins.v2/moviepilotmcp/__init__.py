@@ -85,7 +85,7 @@ class MoviePilotMCP(_PluginBase):
     plugin_name = "MoviePilot MCP Server"
     plugin_desc = "MoviePilot v2.10.4 的 ChatGPT 外部 MCP OAuth 包装层"
     plugin_icon = "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/moviepilotmcp.svg"
-    plugin_version = "0.3.7"
+    plugin_version = "0.3.8"
     plugin_author = "Codex"
     author_url = "https://wiki.movie-pilot.org/"
     plugin_config_prefix = "moviepilotmcp_"
@@ -1186,13 +1186,15 @@ class MoviePilotMCP(_PluginBase):
             return self._default_scopes()
         requested = [item.strip() for item in str(raw_scope).split() if item.strip()]
         allowed = set(self._allowed_scopes())
-        if any(scope not in allowed for scope in requested):
-            raise ValueError("请求了不被允许的 scope")
-        if self._oauth_scopes[1] in requested and not self._enable_write_tools:
-            raise ValueError("当前插件未开启写操作工具，不能授予写操作 scope")
-        if not requested:
+        # 宽松处理：ChatGPT / VS Code 等客户端可能会在 authorize 请求里带上一些
+        # 与本服务器无关的 scope（如 "openid" 或客户端自定义值）。这里按 RFC 6749
+        # 的推荐做法「忽略未知 scope」而不是直接拒绝，避免因客户端差异导致授权失败。
+        filtered = [scope for scope in requested if scope in allowed]
+        if self._oauth_scopes[1] in filtered and not self._enable_write_tools:
+            filtered = [scope for scope in filtered if scope != self._oauth_scopes[1]]
+        if not filtered:
             return self._default_scopes()
-        return requested
+        return filtered
 
     def _default_scopes(self) -> List[str]:
         scopes = [self._oauth_scopes[0]]
