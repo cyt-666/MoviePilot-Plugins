@@ -3,11 +3,12 @@
         "name": "MoviePilot MCP Server",
         "description": "MoviePilot v2.10.4 的 ChatGPT 外部 MCP OAuth 包装层",
         "labels": "MCP,ChatGPT,OpenAI,自动化,MoviePilot",
-        "version": "0.3.3",
+        "version": "0.3.4",
         "icon": "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/moviepilotmcp.svg",
         "author": "Codex",
         "level": 1,
         "history": {
+            "v0.3.4": "补充 OAuth 元数据兼容路径：新增 /.well-known/oauth-authorization-server，并将 issuer 收敛到插件基路径，同时在 protected resource metadata 中显式返回 authorization_server_metadata，提升 VS Code 等客户端对动态注册的发现兼容性。",
             "v0.3.3": "补充 OAuth Dynamic Client Registration：新增 /oauth/register 和 registration_endpoint 元数据，支持 VS Code 等客户端自动注册 public client，避免首次连接时手动填写 client ID。",
             "v0.3.2": "优化 MCP 写操作的显示身份：新增“写入显示名称”配置，订阅等业务记录会优先写入可读名称（默认 ChatGPT MCP），避免在 MoviePilot 页面中显示成纯数字用户标识。",
             "v0.3.1": "修复外部 MCP 工具名兼容性：对外工具名改为仅含小写字母、数字和下划线的格式，避免 VS Code 等客户端将带点号的工具名判定为无效；同时保留旧点号名到新工具名的服务端兼容映射。",

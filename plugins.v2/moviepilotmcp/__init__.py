@@ -85,7 +85,7 @@ class MoviePilotMCP(_PluginBase):
     plugin_name = "MoviePilot MCP Server"
     plugin_desc = "MoviePilot v2.10.4 的 ChatGPT 外部 MCP OAuth 包装层"
     plugin_icon = "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/moviepilotmcp.svg"
-    plugin_version = "0.3.3"
+    plugin_version = "0.3.4"
     plugin_author = "Codex"
     author_url = "https://wiki.movie-pilot.org/"
     plugin_config_prefix = "moviepilotmcp_"
@@ -168,6 +168,14 @@ class MoviePilotMCP(_PluginBase):
                 "methods": ["GET"],
                 "summary": "MoviePilot MCP OAuth authorization server metadata",
                 "description": "供 OAuth 客户端发现 MoviePilot MCP 授权服务器元数据",
+                "allow_anonymous": True,
+            },
+            {
+                "path": "/.well-known/oauth-authorization-server",
+                "endpoint": self.handle_authorization_server_metadata,
+                "methods": ["GET"],
+                "summary": "MoviePilot MCP OAuth authorization server metadata",
+                "description": "供 OAuth 客户端发现 MoviePilot MCP 授权服务器元数据（兼容路径）",
                 "allow_anonymous": True,
             },
             {
@@ -694,6 +702,7 @@ class MoviePilotMCP(_PluginBase):
             {
                 "resource": self._build_endpoint_url(),
                 "authorization_servers": [self._build_issuer_url()],
+                "authorization_server_metadata": self._build_authorization_server_metadata_url(),
                 "bearer_methods_supported": ["header"],
                 "scopes_supported": list(self._allowed_scopes()),
             }
@@ -2345,7 +2354,12 @@ class MoviePilotMCP(_PluginBase):
         return self._absolute_url(self._plugin_api_path("/oauth/register"))
 
     def _build_issuer_url(self) -> str:
-        return self._absolute_url(self._plugin_api_path("/oauth"))
+        return self._absolute_url(self._plugin_api_path())
+
+    def _build_authorization_server_metadata_url(self) -> str:
+        return self._absolute_url(
+            self._plugin_api_path("/.well-known/oauth-authorization-server")
+        )
 
     def _build_resource_metadata_url(self) -> str:
         return self._absolute_url(
