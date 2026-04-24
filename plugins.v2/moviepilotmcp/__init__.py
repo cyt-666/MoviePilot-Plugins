@@ -64,7 +64,7 @@ class MoviePilotMCP(_PluginBase):
     plugin_name = "MoviePilot MCP Server"
     plugin_desc = "MoviePilot v2.10.4 的 ChatGPT 外部 MCP 薄包装层"
     plugin_icon = "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/trakt.png"
-    plugin_version = "0.2.0"
+    plugin_version = "0.2.1"
     plugin_author = "Codex"
     author_url = "https://wiki.movie-pilot.org/"
     plugin_config_prefix = "moviepilotmcp_"
@@ -184,7 +184,11 @@ class MoviePilotMCP(_PluginBase):
                                             "model": "mcp_token",
                                             "label": "MCP Token",
                                             "placeholder": "留空时自动生成",
-                                            "type": "password",
+                                            "type": "{{ show_mcp_token ? 'text' : 'password' }}",
+                                            "appendInnerIcon": "{{ show_mcp_token ? 'mdi-eye-off-outline' : 'mdi-eye-outline' }}",
+                                            "onClick:appendInner": "function () { model.show_mcp_token = !model.show_mcp_token }",
+                                            "hint": "首次安装后可直接复制该 Token 给 VS Code 或 ChatGPT Connector 使用。",
+                                            "persistentHint": True,
                                         },
                                     }
                                 ],
@@ -228,6 +232,7 @@ class MoviePilotMCP(_PluginBase):
             "mcp_token": self._generate_token(),
             "enable_write_tools": True,
             "endpoint_url": endpoint_url,
+            "show_mcp_token": False,
         }
 
     def get_page(self) -> List[dict]:
