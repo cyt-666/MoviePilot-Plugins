@@ -85,7 +85,7 @@ class MoviePilotMCP(_PluginBase):
     plugin_name = "MoviePilot MCP Server"
     plugin_desc = "MoviePilot v2.10.4 的 ChatGPT 外部 MCP OAuth 包装层"
     plugin_icon = "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/moviepilotmcp.svg"
-    plugin_version = "0.3.5"
+    plugin_version = "0.3.7"
     plugin_author = "Codex"
     author_url = "https://wiki.movie-pilot.org/"
     plugin_config_prefix = "moviepilotmcp_"
@@ -98,6 +98,10 @@ class MoviePilotMCP(_PluginBase):
     _oauth_code_ttl = 600
     _oauth_access_token_ttl = 3600
     _oauth_refresh_token_ttl = 30 * 24 * 3600
+    # 插件独立管理员会话（仅服务于授权页），避免误用 MoviePilot 的 resource cookie
+    # 作为登录态导致退出登录后依然能批准授权。
+    _admin_session_cookie_name = "mp_mcp_admin_session"
+    _admin_session_ttl = 30 * 60
     _agent_manager_candidates = [
         ("app.agent.tools.manager", "MoviePilotToolsManager"),
     ]
@@ -198,6 +202,14 @@ class MoviePilotMCP(_PluginBase):
                 "methods": ["GET", "POST"],
                 "summary": "MoviePilot MCP OAuth authorize endpoint",
                 "description": "Authorization Code + PKCE 授权入口",
+                "allow_anonymous": True,
+            },
+            {
+                "path": "/oauth/login",
+                "endpoint": self.handle_admin_login,
+                "methods": ["POST"],
+                "summary": "MoviePilot MCP OAuth admin login",
+                "description": "授权页内管理员登录（校验 MoviePilot 超级管理员凭证后颁发插件会话 Cookie）",
                 "allow_anonymous": True,
             },
             {
@@ -536,19 +548,53 @@ class MoviePilotMCP(_PluginBase):
             logger.error(f"MoviePilot MCP 请求体解析失败：{err}")
             return self._jsonrpc_error(None, -32700, "Invalid JSON")
 
+        # 批量请求：MCP 客户端（ChatGPT/VS Code）可能以数组形式发送
+        if isinstance(payload, list):
+            responses = []
+            for item in payload:
+                if not isinstance(item, dict):
+                    continue
+                resp = await self._dispatch_mcp_message(item, auth_context)
+                if resp is not None:
+                    responses.append(resp)
+            if not responses:
+                # 全是通知，Streamable HTTP 要求返回 202 无 body
+                return JSONResponse(content=None, status_code=202)
+            return JSONResponse(responses)
+
         if not isinstance(payload, dict):
             return self._jsonrpc_error(None, -32600, "Invalid Request")
 
-        request_id = payload.get("id")
-        method = payload.get("method")
-        params = payload.get("params") or {}
+        response = await self._dispatch_mcp_message(payload, auth_context)
+        if response is None:
+            # 通知（notification）按 JSON-RPC / MCP Streamable HTTP 规范返回 202，无 body
+            return JSONResponse(content=None, status_code=202)
+        return response
 
+    async def _dispatch_mcp_message(
+        self, message: Dict[str, Any], auth_context: Dict[str, Any]
+    ) -> Optional[Any]:
+        request_id = message.get("id")
+        method = message.get("method")
+        params = message.get("params") or {}
+        is_notification = request_id is None
+
+        # 非请求消息（通知 / 响应）一律静默 ACK
         if not method:
-            return self._jsonrpc_error(request_id, -32600, "Missing method")
+            return None if is_notification else self._jsonrpc_error(
+                request_id, -32600, "Missing method"
+            )
+
+        # MCP 规范的通知方法：notifications/initialized、notifications/cancelled 等
+        if is_notification or method.startswith("notifications/"):
+            logger.debug(f"MoviePilot MCP notification received: {method}")
+            return None
 
         try:
             if method == "initialize":
                 result = self._handle_initialize(params)
+            elif method == "ping":
+                result = {}
             elif method == "tools/list":
                 result = self._handle_tools_list()
             elif method == "tools/call":
@@ -562,6 +608,13 @@ class MoviePilotMCP(_PluginBase):
             logger.error(f"MoviePilot MCP 调用失败：{err}", exc_info=True)
             return self._jsonrpc_error(request_id, -32603, str(err))
 
+    # 本插件支持的 MCP 协议版本（按时间倒序），initialize 时会按客户端声明优先选择最匹配的版本
+    _supported_protocol_versions = (
+        "2025-06-18",
+        "2025-03-26",
+        "2024-11-05",
+    )
+
     def _handle_initialize(self, params: Dict[str, Any]) -> Dict[str, Any]:
         self._refresh_agent_catalog(force=True)
         client_info = params.get("clientInfo") or {}
@@ -569,6 +622,13 @@ class MoviePilotMCP(_PluginBase):
             "MoviePilot MCP client initialized: %s",
             client_info.get("name") or "unknown",
         )
+        # 协议版本协商：若客户端声明的版本在我们支持范围内则原样返回，
+        # 否则返回我们支持的最新版本，让客户端决定兼容策略。
+        requested_version = str(params.get("protocolVersion") or "").strip()
+        if requested_version in self._supported_protocol_versions:
+            negotiated_version = requested_version
+        else:
+            negotiated_version = self._supported_protocol_versions[0]
         instructions = (
             "Use tools to read and operate MoviePilot safely through the external ChatGPT MCP wrapper. "
             "This wrapper only exposes a curated subset of internal Agent tools."
@@ -576,7 +636,7 @@ class MoviePilotMCP(_PluginBase):
         if not self._agent_available:
             instructions += f" Internal Agent tools are currently unavailable: {self._agent_error or 'unknown'}"
         return {
-            "protocolVersion": self._protocol_version,
+            "protocolVersion": negotiated_version,
             "capabilities": {
                 "tools": {
                     "listChanged": False,
@@ -804,18 +864,110 @@ class MoviePilotMCP(_PluginBase):
             response_types=[str(item) for item in response_types],
         )
         client_info = self._get_registered_client(client_id) or {}
+        # 按 RFC 7591 返回完整的动态客户端注册元数据，
+        # 特别是 client_secret_expires_at=0（永不过期）以便 VS Code 等客户端
+        # 在重启后可以复用已持久化的 client_id 进行 refresh_token 刷新，
+        # 避免每次启动都走一遍交互式授权。
         return JSONResponse(
             {
                 "client_id": client_id,
                 "client_id_issued_at": self._now(),
+                "client_secret_expires_at": 0,
                 "client_name": client_info.get("client_name") or client_name,
                 "redirect_uris": client_info.get("redirect_uris") or redirect_uris,
                 "grant_types": client_info.get("grant_types") or grant_types,
                 "response_types": client_info.get("response_types") or response_types,
                 "token_endpoint_auth_method": "none",
+                "application_type": "native",
             },
             status_code=201,
         )
+
+    async def handle_admin_login(self, request: Request):
+        """
+        授权页内嵌的管理员登录：校验 MoviePilot 超级管理员账号密码（可选 OTP），
+        通过后颁发插件自己的短 TTL 会话 Cookie，并 302 回到原授权入口继续流程。
+        """
+        if not self._enabled:
+            raise HTTPException(status_code=403, detail="MoviePilot MCP 包装层未启用")
+
+        params = await self._parse_form_request(request)
+        try:
+            auth_request = self._parse_authorize_request(params)
+        except Exception as err:
+            return HTMLResponse(self._render_authorize_error(str(err)), status_code=400)
+
+        username = (params.get("username") or "").strip()
+        password = params.get("password") or ""
+        otp_password = (params.get("otp_password") or "").strip() or None
+        if not username or not password:
+            return HTMLResponse(
+                self._render_login_required_page(
+                    auth_request, error="请输入用户名和密码"
+                ),
+                status_code=400,
+            )
+
+        try:
+            from app.chain.user import UserChain  # 延迟导入，避免插件加载期副作用
+            success, user_or_message = UserChain().user_authenticate(
+                username=username, password=password, mfa_code=otp_password
+            )
+        except Exception as err:
+            logger.error(f"MoviePilot MCP 登录时调用 UserChain 失败：{err}", exc_info=True)
+            return HTMLResponse(
+                self._render_login_required_page(
+                    auth_request, error="服务器内部错误，请查看 MoviePilot 日志"
+                ),
+                status_code=500,
+            )
+
+        if not success:
+            message = str(user_or_message) if user_or_message else "用户名或密码错误"
+            return HTMLResponse(
+                self._render_login_required_page(auth_request, error=message),
+                status_code=401,
+            )
+
+        if not getattr(user_or_message, "is_superuser", False):
+            return HTMLResponse(
+                self._render_login_required_page(
+                    auth_request,
+                    error="仅允许 MoviePilot 超级管理员批准 MCP 授权，请改用管理员账号登录",
+                ),
+                status_code=403,
+            )
+
+        session_token, expires_at = self._issue_admin_session(
+            subject=getattr(user_or_message, "id", 0),
+            username=getattr(user_or_message, "name", username) or username,
+        )
+
+        # 302 回到 /oauth/authorize，保留原查询参数，让 GET 分支渲染批准页
+        redirect_target = self._append_query_params(
+            self._build_authorization_url(),
+            {
+                "response_type": "code",
+                "client_id": auth_request.client_id,
+                "redirect_uri": auth_request.redirect_uri,
+                "state": auth_request.state or "",
+                "scope": self._format_scope(auth_request.scopes),
+                "code_challenge": auth_request.code_challenge,
+                "code_challenge_method": auth_request.code_challenge_method,
+            },
+        )
+        response = RedirectResponse(redirect_target, status_code=302)
+        response.set_cookie(
+            key=self._admin_session_cookie_name,
+            value=session_token,
+            max_age=max(1, expires_at - self._now()),
+            httponly=True,
+            secure=request.url.scheme == "https",
+            samesite="lax",
+            # 约束 cookie 到插件前缀，避免污染 MoviePilot 其他路径
+            path=self._plugin_api_path(),
+        )
+        return response
 
     def _handle_authorize_get(self, request: Request):
         try:
@@ -1120,6 +1272,7 @@ class MoviePilotMCP(_PluginBase):
             "codes": dict(data.get("codes") or {}),
             "access_tokens": dict(data.get("access_tokens") or {}),
             "refresh_tokens": dict(data.get("refresh_tokens") or {}),
+            "admin_sessions": dict(data.get("admin_sessions") or {}),
         }
 
     def _save_oauth_store(self, store: Dict[str, Any]) -> None:
@@ -1127,7 +1280,7 @@ class MoviePilotMCP(_PluginBase):
 
     def _prune_oauth_store(self, store: Dict[str, Any]) -> None:
         now = self._now()
-        for bucket in ("codes", "access_tokens", "refresh_tokens"):
+        for bucket in ("codes", "access_tokens", "refresh_tokens", "admin_sessions"):
             values = store.get(bucket) or {}
             expired = [key for key, item in values.items() if (item or {}).get("expires_at", 0) < now]
             for key in expired:
@@ -1192,27 +1345,49 @@ class MoviePilotMCP(_PluginBase):
         return {"WWW-Authenticate": ", ".join(parts)}
 
     def _get_logged_in_admin(self, request: Request) -> Optional[Dict[str, Any]]:
-        authorization = request.headers.get("authorization") or ""
-        if authorization.startswith("Bearer "):
-            payload = self._decode_moviepilot_token(
-                authorization.split(" ", 1)[1].strip(),
-                purpose="authentication",
-            )
-            if payload and payload.get("super_user"):
-                return {
-                    "subject": str(payload.get("sub")),
-                    "username": payload.get("username") or "admin",
-                }
+        """
+        读取插件自管理的管理员会话。
 
-        resource_token = request.cookies.get(settings.PROJECT_NAME)
-        if resource_token:
-            payload = self._decode_moviepilot_token(resource_token, purpose="resource")
-            if payload and payload.get("super_user"):
-                return {
-                    "subject": str(payload.get("sub")),
-                    "username": payload.get("username") or "admin",
-                }
-        return None
+        之前曾尝试读取 MoviePilot 主站的 Bearer token / resource HttpOnly cookie 作为
+        登录态，但 MoviePilot 的 resource cookie 在用户从 Web UI 退出登录时不会被后端
+        清除（MoviePilot 没有登出接口，前端只清 localStorage），这会导致授权页把已退出
+        的用户仍然当成已登录的管理员，出现「明明退出了还能批准授权」的严重安全问题。
+
+        因此这里仅信任插件自己通过 `/oauth/login` 颁发并维护的短 TTL 会话。
+        """
+        session_token = request.cookies.get(self._admin_session_cookie_name)
+        if not session_token:
+            return None
+        store = self._load_oauth_store()
+        self._prune_oauth_store(store)
+        session = (store.get("admin_sessions") or {}).get(session_token)
+        if not session:
+            self._save_oauth_store(store)
+            return None
+        if session.get("expires_at", 0) < self._now():
+            (store.get("admin_sessions") or {}).pop(session_token, None)
+            self._save_oauth_store(store)
+            return None
+        # 命中会话，顺带做一次过期剪枝
+        self._save_oauth_store(store)
+        return {
+            "subject": session.get("subject"),
+            "username": session.get("username") or "admin",
+            "session_token": session_token,
+        }
+
+    def _issue_admin_session(self, subject: str, username: str) -> Tuple[str, int]:
+        store = self._load_oauth_store()
+        self._prune_oauth_store(store)
+        session_token = self._generate_token()
+        expires_at = self._now() + self._admin_session_ttl
+        store.setdefault("admin_sessions", {})[session_token] = {
+            "subject": str(subject),
+            "username": username,
+            "expires_at": expires_at,
+        }
+        self._save_oauth_store(store)
+        return session_token, expires_at
 
     def _decode_moviepilot_token(self, token: str, purpose: str) -> Optional[Dict[str, Any]]:
         if not token:
@@ -1309,26 +1484,71 @@ class MoviePilotMCP(_PluginBase):
 </body>
 </html>"""
 
-    def _render_login_required_page(self, auth_request: OAuthAuthorizeRequest) -> str:
+    def _render_login_required_page(
+        self,
+        auth_request: OAuthAuthorizeRequest,
+        error: Optional[str] = None,
+    ) -> str:
         safe_scope = html.escape(self._format_scope(auth_request.scopes))
+        safe_client = html.escape(auth_request.client_id)
+        safe_redirect = html.escape(auth_request.redirect_uri)
+        login_action = html.escape(self._build_login_url())
+        hidden_fields = "\n".join(
+            [
+                self._hidden_field("response_type", "code"),
+                self._hidden_field("client_id", auth_request.client_id),
+                self._hidden_field("redirect_uri", auth_request.redirect_uri),
+                self._hidden_field("state", auth_request.state or ""),
+                self._hidden_field("scope", self._format_scope(auth_request.scopes)),
+                self._hidden_field("code_challenge", auth_request.code_challenge),
+                self._hidden_field("code_challenge_method", auth_request.code_challenge_method),
+            ]
+        )
+        error_html = (
+            f'<p class="error">{html.escape(error)}</p>' if error else ""
+        )
         return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>MoviePilot MCP 授权</title>
+  <title>MoviePilot MCP 登录</title>
   <style>
-    body {{ font-family: sans-serif; background: #f8fafc; color: #1e293b; margin: 0; padding: 24px; }}
-    .card {{ max-width: 720px; margin: 0 auto; background: #fff; border-radius: 16px; padding: 28px; box-shadow: 0 12px 30px rgba(15, 23, 42, 0.08); }}
-    p {{ line-height: 1.6; }}
+    body {{ font-family: sans-serif; background: #f5f7fb; color: #1f2937; margin: 0; padding: 24px; }}
+    .card {{ max-width: 480px; margin: 0 auto; background: #fff; border-radius: 16px; padding: 28px; box-shadow: 0 12px 30px rgba(15, 23, 42, 0.08); }}
+    h1 {{ margin-top: 0; font-size: 22px; }}
+    .hint {{ color: #475569; font-size: 14px; line-height: 1.6; }}
+    .meta {{ background: #f8fafc; border-radius: 12px; padding: 12px 16px; margin: 16px 0; font-size: 13px; color: #475569; }}
+    .meta p {{ margin: 4px 0; word-break: break-all; }}
+    label {{ display: block; margin-top: 14px; font-size: 14px; color: #334155; }}
+    input {{ width: 100%; margin-top: 6px; padding: 10px 12px; border: 1px solid #cbd5e1; border-radius: 10px; font-size: 14px; box-sizing: border-box; }}
+    button {{ width: 100%; margin-top: 20px; border: 0; border-radius: 10px; padding: 12px; font-size: 15px; cursor: pointer; background: #0f766e; color: #fff; }}
+    .error {{ background: #fee2e2; color: #991b1b; border-radius: 10px; padding: 10px 14px; font-size: 14px; margin-top: 16px; }}
   </style>
 </head>
 <body>
   <div class="card">
-    <h1>需要先登录 MoviePilot</h1>
-    <p>当前浏览器没有检测到 MoviePilot 管理员登录态，因此暂时不能批准 OAuth 授权。</p>
-    <p>请先在同一浏览器中登录 MoviePilot 管理界面，再刷新当前页面继续授权。</p>
-    <p>本次申请范围：<strong>{safe_scope}</strong></p>
+    <h1>登录 MoviePilot 以授权 MCP 访问</h1>
+    <p class="hint">请使用 <strong>MoviePilot 超级管理员账号</strong> 登录。登录态仅用于本次授权，独立于 MoviePilot 主站会话。</p>
+    <div class="meta">
+      <p><strong>客户端：</strong>{safe_client}</p>
+      <p><strong>回调地址：</strong>{safe_redirect}</p>
+      <p><strong>申请范围：</strong>{safe_scope}</p>
+    </div>
+    {error_html}
+    <form method="post" action="{login_action}" autocomplete="off">
+      {hidden_fields}
+      <label>用户名
+        <input type="text" name="username" required autofocus>
+      </label>
+      <label>密码
+        <input type="password" name="password" required>
+      </label>
+      <label>二次验证码（可选）
+        <input type="text" name="otp_password" inputmode="numeric" autocomplete="one-time-code">
+      </label>
+      <button type="submit">登录并继续授权</button>
+    </form>
   </div>
 </body>
 </html>"""
@@ -2363,6 +2583,9 @@ class MoviePilotMCP(_PluginBase):
 
     def _build_token_url(self) -> str:
         return self._absolute_url(self._plugin_api_path("/oauth/token"))
+
+    def _build_login_url(self) -> str:
+        return self._absolute_url(self._plugin_api_path("/oauth/login"))
 
     def _build_registration_url(self) -> str:
         return self._absolute_url(self._plugin_api_path("/oauth/register"))
