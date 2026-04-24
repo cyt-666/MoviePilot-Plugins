@@ -1,13 +1,20 @@
 import importlib
 import inspect
 import json
+import base64
+import hashlib
+import html
 import secrets
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
+import jwt
 from fastapi import HTTPException, Request
 from fastapi.encoders import jsonable_encoder
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from app import schemas
 from app.core.config import settings
@@ -56,15 +63,29 @@ class AgentToolBinding:
     fallback_handler: Optional[Callable[[Dict[str, Any]], Any]] = None
 
 
+@dataclass
+class OAuthAuthorizeRequest:
+    """
+    OAuth 授权请求
+    """
+
+    client_id: str
+    redirect_uri: str
+    state: Optional[str]
+    scopes: List[str]
+    code_challenge: str
+    code_challenge_method: str
+
+
 class MoviePilotMCP(_PluginBase):
     """
     MoviePilot ChatGPT MCP 薄包装插件
     """
 
     plugin_name = "MoviePilot MCP Server"
-    plugin_desc = "MoviePilot v2.10.4 的 ChatGPT 外部 MCP 薄包装层"
+    plugin_desc = "MoviePilot v2.10.4 的 ChatGPT 外部 MCP OAuth 包装层"
     plugin_icon = "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/moviepilotmcp.svg"
-    plugin_version = "0.2.3"
+    plugin_version = "0.3.2"
     plugin_author = "Codex"
     author_url = "https://wiki.movie-pilot.org/"
     plugin_config_prefix = "moviepilotmcp_"
@@ -73,6 +94,10 @@ class MoviePilotMCP(_PluginBase):
 
     _protocol_version = "2024-11-05"
     _server_name = "moviepilot-chatgpt-wrapper"
+    _oauth_scopes = ("moviepilot.mcp.read", "moviepilot.mcp.write")
+    _oauth_code_ttl = 600
+    _oauth_access_token_ttl = 3600
+    _oauth_refresh_token_ttl = 30 * 24 * 3600
     _agent_manager_candidates = [
         ("app.agent.tools.manager", "MoviePilotToolsManager"),
     ]
@@ -80,7 +105,9 @@ class MoviePilotMCP(_PluginBase):
     def __init__(self):
         super().__init__()
         self._enabled = False
+        self._allow_legacy_token = False
         self._mcp_token = ""
+        self._actor_name = "ChatGPT MCP"
         self._enable_write_tools = True
         self._tools: Dict[str, MCPTool] = {}
         self._bindings: Dict[str, AgentToolBinding] = {}
@@ -93,7 +120,9 @@ class MoviePilotMCP(_PluginBase):
         config = config or {}
         self._enabled = bool(config.get("enabled", False))
         self._enable_write_tools = bool(config.get("enable_write_tools", True))
+        self._allow_legacy_token = bool(config.get("allow_legacy_token", False))
         self._mcp_token = (config.get("mcp_token") or "").strip()
+        self._actor_name = (config.get("actor_name") or "ChatGPT MCP").strip() or "ChatGPT MCP"
 
         if not self._mcp_token:
             self._mcp_token = self._generate_token()
@@ -102,6 +131,8 @@ class MoviePilotMCP(_PluginBase):
             {
                 "enabled": self._enabled,
                 "mcp_token": self._mcp_token,
+                "allow_legacy_token": self._allow_legacy_token,
+                "actor_name": self._actor_name,
                 "enable_write_tools": self._enable_write_tools,
             }
         )
@@ -122,11 +153,46 @@ class MoviePilotMCP(_PluginBase):
                 "summary": "MoviePilot MCP endpoint",
                 "description": "ChatGPT App 可连接的受控 MCP JSON-RPC 接口",
                 "allow_anonymous": True,
-            }
+            },
+            {
+                "path": "/.well-known/oauth-protected-resource",
+                "endpoint": self.handle_protected_resource_metadata,
+                "methods": ["GET"],
+                "summary": "MoviePilot MCP OAuth protected resource metadata",
+                "description": "供 OAuth 客户端发现 MoviePilot MCP 资源元数据",
+                "allow_anonymous": True,
+            },
+            {
+                "path": "/oauth/.well-known/oauth-authorization-server",
+                "endpoint": self.handle_authorization_server_metadata,
+                "methods": ["GET"],
+                "summary": "MoviePilot MCP OAuth authorization server metadata",
+                "description": "供 OAuth 客户端发现 MoviePilot MCP 授权服务器元数据",
+                "allow_anonymous": True,
+            },
+            {
+                "path": "/oauth/authorize",
+                "endpoint": self.handle_authorize,
+                "methods": ["GET", "POST"],
+                "summary": "MoviePilot MCP OAuth authorize endpoint",
+                "description": "Authorization Code + PKCE 授权入口",
+                "allow_anonymous": True,
+            },
+            {
+                "path": "/oauth/token",
+                "endpoint": self.handle_token,
+                "methods": ["POST"],
+                "summary": "MoviePilot MCP OAuth token endpoint",
+                "description": "Authorization Code / Refresh Token 令牌交换入口",
+                "allow_anonymous": True,
+            },
         ]
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         endpoint_url = self._build_endpoint_url()
+        authorize_url = self._build_authorization_url()
+        token_url = self._build_token_url()
+        metadata_url = self._build_resource_metadata_url()
         return [
             {
                 "component": "VForm",
@@ -143,7 +209,7 @@ class MoviePilotMCP(_PluginBase):
                                         "props": {
                                             "type": "info",
                                             "variant": "tonal",
-                                            "text": "该插件是 MoviePilot 内置 Agent 工具的 ChatGPT 外部 MCP 包装层：对外提供独立入口与独立密钥，对内优先复用内置 Agent tools。",
+                                            "text": "该插件是 MoviePilot 内置 Agent 工具的 ChatGPT 外部 MCP OAuth 包装层：对外暴露独立 MCP 入口，对内优先复用内置 Agent tools，并通过 OAuth 2.0 Authorization Code + PKCE 完成授权。",
                                         },
                                     }
                                 ],
@@ -179,10 +245,39 @@ class MoviePilotMCP(_PluginBase):
                                 "props": {"cols": 12, "md": 6},
                                 "content": [
                                     {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "actor_name",
+                                            "label": "写入显示名称",
+                                            "placeholder": "例如：ChatGPT MCP",
+                                            "hint": "用于订阅等业务记录中的显示名称，避免在 MoviePilot 页面中显示成纯数字用户标识。",
+                                            "persistentHint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "allow_legacy_token",
+                                            "label": "启用兼容静态 Token",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
                                         "component": "VSwitch",
                                         "props": {
                                             "model": "show_mcp_token",
-                                            "label": "显示 Token 明文",
+                                            "label": "显示兼容 Token 明文",
                                         },
                                     }
                                 ],
@@ -195,11 +290,26 @@ class MoviePilotMCP(_PluginBase):
                                         "component": "VTextField",
                                         "props": {
                                             "model": "mcp_token",
-                                            "label": "MCP Token",
+                                            "label": "兼容静态 Token",
                                             "placeholder": "留空时自动生成",
                                             "type": "{{ show_mcp_token ? 'text' : 'password' }}",
-                                            "hint": "首次安装后可直接复制该 Token 给 VS Code 或 ChatGPT Connector 使用。",
+                                            "hint": "仅供不支持 OAuth 的私有调试客户端备用，不再推荐用于正式 ChatGPT Connector。",
                                             "persistentHint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "oauth_scope",
+                                            "label": "OAuth Scope",
+                                            "readonly": True,
+                                            "variant": "outlined",
                                         },
                                     }
                                 ],
@@ -222,6 +332,36 @@ class MoviePilotMCP(_PluginBase):
                             },
                             {
                                 "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "authorize_url",
+                                            "label": "OAuth Authorization URL",
+                                            "readonly": True,
+                                            "variant": "outlined",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "token_url",
+                                            "label": "OAuth Token URL",
+                                            "readonly": True,
+                                            "variant": "outlined",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
                                 "props": {"cols": 12},
                                 "content": [
                                     {
@@ -229,7 +369,22 @@ class MoviePilotMCP(_PluginBase):
                                         "props": {
                                             "type": "warning",
                                             "variant": "tonal",
-                                            "text": "仅支持 tools，不开放 resources/prompts；不复用 MoviePilot 全局 API Key；默认裁剪高风险工具。",
+                                            "text": "推荐使用 OAuth 2.0 Authorization Code + PKCE；仅支持 tools，不开放 resources/prompts；不复用 MoviePilot 全局 API Key；已移除 URL query token 作为推荐接入方式。",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "resource_metadata_url",
+                                            "label": "Protected Resource Metadata URL",
+                                            "readonly": True,
+                                            "variant": "outlined",
                                         },
                                     }
                                 ],
@@ -241,8 +396,14 @@ class MoviePilotMCP(_PluginBase):
         ], {
             "enabled": False,
             "mcp_token": self._generate_token(),
+            "allow_legacy_token": False,
+            "actor_name": "ChatGPT MCP",
             "enable_write_tools": True,
             "endpoint_url": endpoint_url,
+            "authorize_url": authorize_url,
+            "token_url": token_url,
+            "resource_metadata_url": metadata_url,
+            "oauth_scope": self._format_scope(self._default_scopes()),
             "show_mcp_token": False,
         }
 
@@ -250,6 +411,8 @@ class MoviePilotMCP(_PluginBase):
         self._refresh_agent_catalog(force=True)
         enabled_tools = self._available_tools()
         endpoint_url = self._build_endpoint_url()
+        authorize_url = self._build_authorization_url()
+        token_url = self._build_token_url()
         status_text = "已就绪" if self._agent_available else "不可用"
         agent_text = (
             f"内置 Agent 工具状态：{status_text}"
@@ -277,6 +440,14 @@ class MoviePilotMCP(_PluginBase):
                     },
                     {
                         "component": "VCardText",
+                        "text": f"OAuth Authorization：{authorize_url}",
+                    },
+                    {
+                        "component": "VCardText",
+                        "text": f"OAuth Token：{token_url}",
+                    },
+                    {
+                        "component": "VCardText",
                         "text": agent_text,
                     },
                     {
@@ -286,6 +457,14 @@ class MoviePilotMCP(_PluginBase):
                     {
                         "component": "VCardText",
                         "text": f"写操作工具：{'已开启' if self._enable_write_tools else '已关闭'}",
+                    },
+                    {
+                        "component": "VCardText",
+                        "text": f"写入显示名称：{self._actor_name}",
+                    },
+                    {
+                        "component": "VCardText",
+                        "text": f"兼容静态 Token：{'已开启' if self._allow_legacy_token else '已关闭'}",
                     },
                 ],
             }
@@ -319,7 +498,7 @@ class MoviePilotMCP(_PluginBase):
         if not self._enabled:
             raise HTTPException(status_code=403, detail="MoviePilot MCP 包装层未启用")
 
-        self._verify_mcp_token(request)
+        auth_context = self._authorize_mcp_request(request)
 
         try:
             payload = await request.json()
@@ -343,7 +522,7 @@ class MoviePilotMCP(_PluginBase):
             elif method == "tools/list":
                 result = self._handle_tools_list()
             elif method == "tools/call":
-                result = await self._handle_tools_call(params)
+                result = await self._handle_tools_call(params, auth_context)
             else:
                 raise MCPError(-32601, f"Method not found: {method}")
             return self._jsonrpc_result(request_id, result)
@@ -399,8 +578,10 @@ class MoviePilotMCP(_PluginBase):
             ]
         }
 
-    async def _handle_tools_call(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        tool_name = params.get("name")
+    async def _handle_tools_call(
+        self, params: Dict[str, Any], auth_context: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        tool_name = self._canonical_tool_name(params.get("name"))
         if not tool_name:
             raise MCPError(-32602, "Missing tool name")
 
@@ -416,6 +597,8 @@ class MoviePilotMCP(_PluginBase):
 
         if tool.is_write and not self._enable_write_tools:
             raise MCPError(-32601, f"Tool not found: {tool_name}")
+        if tool.is_write and self._oauth_scopes[1] not in auth_context.get("scopes", []):
+            raise MCPError(-32010, "当前访问令牌未授予写操作 scope")
 
         if tool_name not in self._available_tools():
             raise MCPError(
@@ -490,21 +673,582 @@ class MoviePilotMCP(_PluginBase):
             },
         }
 
-    def _verify_mcp_token(self, request: Request) -> None:
-        expected = self._mcp_token.strip()
-        if not expected:
-            raise HTTPException(status_code=503, detail="MCP token 未配置")
+    @staticmethod
+    def _canonical_tool_name(name: Any) -> Optional[str]:
+        if not name:
+            return None
+        return str(name).strip().replace(".", "_")
 
+    async def handle_protected_resource_metadata(self, _: Request):
+        if not self._enabled:
+            raise HTTPException(status_code=403, detail="MoviePilot MCP 包装层未启用")
+        return JSONResponse(
+            {
+                "resource": self._build_endpoint_url(),
+                "authorization_servers": [self._build_issuer_url()],
+                "bearer_methods_supported": ["header"],
+                "scopes_supported": list(self._allowed_scopes()),
+            }
+        )
+
+    async def handle_authorization_server_metadata(self, _: Request):
+        if not self._enabled:
+            raise HTTPException(status_code=403, detail="MoviePilot MCP 包装层未启用")
+        return JSONResponse(
+            {
+                "issuer": self._build_issuer_url(),
+                "authorization_endpoint": self._build_authorization_url(),
+                "token_endpoint": self._build_token_url(),
+                "response_types_supported": ["code"],
+                "grant_types_supported": ["authorization_code", "refresh_token"],
+                "code_challenge_methods_supported": ["S256", "plain"],
+                "token_endpoint_auth_methods_supported": ["none"],
+                "scopes_supported": list(self._allowed_scopes()),
+            }
+        )
+
+    async def handle_authorize(self, request: Request):
+        if not self._enabled:
+            raise HTTPException(status_code=403, detail="MoviePilot MCP 包装层未启用")
+        if request.method == "POST":
+            return await self._handle_authorize_post(request)
+        return self._handle_authorize_get(request)
+
+    async def handle_token(self, request: Request):
+        if not self._enabled:
+            raise HTTPException(status_code=403, detail="MoviePilot MCP 包装层未启用")
+
+        params = await self._parse_form_request(request)
+        grant_type = (params.get("grant_type") or "").strip()
+        if grant_type == "authorization_code":
+            return self._handle_authorization_code_grant(params)
+        if grant_type == "refresh_token":
+            return self._handle_refresh_token_grant(params)
+        return self._oauth_error_response(
+            "unsupported_grant_type",
+            "仅支持 authorization_code 和 refresh_token",
+            status_code=400,
+        )
+
+    def _handle_authorize_get(self, request: Request):
+        try:
+            auth_request = self._parse_authorize_request(dict(request.query_params))
+        except HTTPException:
+            raise
+        except Exception as err:
+            return HTMLResponse(self._render_authorize_error(str(err)), status_code=400)
+
+        admin = self._get_logged_in_admin(request)
+        if not admin:
+            return HTMLResponse(
+                self._render_login_required_page(auth_request),
+                status_code=401,
+            )
+        return HTMLResponse(self._render_authorize_page(auth_request, admin))
+
+    async def _handle_authorize_post(self, request: Request):
+        params = await self._parse_form_request(request)
+        try:
+            auth_request = self._parse_authorize_request(params)
+        except Exception as err:
+            redirect_uri = params.get("redirect_uri")
+            if redirect_uri and self._is_safe_redirect_uri(redirect_uri):
+                return self._oauth_redirect_error(
+                    redirect_uri=redirect_uri,
+                    error="invalid_request",
+                    description=str(err),
+                    state=params.get("state"),
+                )
+            return HTMLResponse(self._render_authorize_error(str(err)), status_code=400)
+
+        admin = self._get_logged_in_admin(request)
+        if not admin:
+            return HTMLResponse(self._render_login_required_page(auth_request), status_code=401)
+
+        action = (params.get("action") or "deny").strip().lower()
+        if action != "approve":
+            return self._oauth_redirect_error(
+                redirect_uri=auth_request.redirect_uri,
+                error="access_denied",
+                description="管理员拒绝了本次授权",
+                state=auth_request.state,
+            )
+
+        code = self._issue_authorization_code(auth_request, admin)
+        redirect_params = {"code": code}
+        if auth_request.state:
+            redirect_params["state"] = auth_request.state
+        return RedirectResponse(
+            self._append_query_params(auth_request.redirect_uri, redirect_params),
+            status_code=302,
+        )
+
+    def _handle_authorization_code_grant(self, params: Dict[str, str]):
+        code = (params.get("code") or "").strip()
+        redirect_uri = (params.get("redirect_uri") or "").strip()
+        client_id = (params.get("client_id") or "").strip()
+        code_verifier = (params.get("code_verifier") or "").strip()
+        if not code or not redirect_uri or not client_id or not code_verifier:
+            return self._oauth_error_response(
+                "invalid_request",
+                "缺少 code、redirect_uri、client_id 或 code_verifier",
+                status_code=400,
+            )
+
+        store = self._load_oauth_store()
+        self._prune_oauth_store(store)
+        code_info = (store.get("codes") or {}).pop(code, None)
+        self._save_oauth_store(store)
+        if not code_info:
+            return self._oauth_error_response("invalid_grant", "授权码不存在或已失效", status_code=400)
+        if code_info.get("expires_at", 0) < self._now():
+            return self._oauth_error_response("invalid_grant", "授权码已过期", status_code=400)
+        if redirect_uri != code_info.get("redirect_uri") or client_id != code_info.get("client_id"):
+            return self._oauth_error_response("invalid_grant", "客户端信息不匹配", status_code=400)
+        if not self._verify_pkce(
+            code_verifier=code_verifier,
+            code_challenge=code_info.get("code_challenge", ""),
+            method=code_info.get("code_challenge_method", "S256"),
+        ):
+            return self._oauth_error_response("invalid_grant", "PKCE 校验失败", status_code=400)
+
+        token_payload = self._issue_token_pair(
+            client_id=client_id,
+            redirect_uri=redirect_uri,
+            scopes=code_info.get("scopes") or self._default_scopes(),
+            subject=code_info.get("subject") or "admin",
+            username=code_info.get("username") or "admin",
+        )
+        return JSONResponse(token_payload)
+
+    def _handle_refresh_token_grant(self, params: Dict[str, str]):
+        refresh_token = (params.get("refresh_token") or "").strip()
+        client_id = (params.get("client_id") or "").strip()
+        if not refresh_token or not client_id:
+            return self._oauth_error_response(
+                "invalid_request",
+                "缺少 refresh_token 或 client_id",
+                status_code=400,
+            )
+
+        store = self._load_oauth_store()
+        self._prune_oauth_store(store)
+        refresh_info = (store.get("refresh_tokens") or {}).pop(refresh_token, None)
+        self._save_oauth_store(store)
+        if not refresh_info:
+            return self._oauth_error_response("invalid_grant", "refresh token 不存在或已失效", status_code=400)
+        if refresh_info.get("expires_at", 0) < self._now():
+            return self._oauth_error_response("invalid_grant", "refresh token 已过期", status_code=400)
+        if client_id != refresh_info.get("client_id"):
+            return self._oauth_error_response("invalid_grant", "client_id 不匹配", status_code=400)
+
+        token_payload = self._issue_token_pair(
+            client_id=client_id,
+            redirect_uri=refresh_info.get("redirect_uri") or "",
+            scopes=refresh_info.get("scopes") or self._default_scopes(),
+            subject=refresh_info.get("subject") or "admin",
+            username=refresh_info.get("username") or "admin",
+        )
+        return JSONResponse(token_payload)
+
+    def _authorize_mcp_request(self, request: Request) -> Dict[str, Any]:
+        authorization = request.headers.get("authorization") or ""
+        if not authorization.startswith("Bearer "):
+            raise HTTPException(
+                status_code=401,
+                detail="缺少 Bearer token",
+                headers=self._challenge_headers(),
+            )
+
+        token = authorization.split(" ", 1)[1].strip()
+        if not token:
+            raise HTTPException(
+                status_code=401,
+                detail="缺少 Bearer token",
+                headers=self._challenge_headers(),
+            )
+
+        if self._allow_legacy_token and token == self._mcp_token.strip():
+            return {
+                "subject": "legacy-admin",
+                "username": "legacy-admin",
+                "scopes": self._default_scopes(),
+                "legacy": True,
+            }
+
+        store = self._load_oauth_store()
+        self._prune_oauth_store(store)
+        access_info = (store.get("access_tokens") or {}).get(token)
+        if not access_info:
+            self._save_oauth_store(store)
+            raise HTTPException(
+                status_code=401,
+                detail="访问令牌无效",
+                headers=self._challenge_headers(error="invalid_token", description="access token 无效"),
+            )
+        if access_info.get("expires_at", 0) < self._now():
+            (store.get("access_tokens") or {}).pop(token, None)
+            self._save_oauth_store(store)
+            raise HTTPException(
+                status_code=401,
+                detail="访问令牌已过期",
+                headers=self._challenge_headers(error="invalid_token", description="access token 已过期"),
+            )
+
+        self._save_oauth_store(store)
+        return access_info
+
+    async def _parse_form_request(self, request: Request) -> Dict[str, str]:
+        body = (await request.body()).decode("utf-8", errors="ignore")
+        parsed = dict(parse_qsl(body, keep_blank_values=True))
+        if parsed:
+            return parsed
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        if isinstance(payload, dict):
+            return {str(k): "" if v is None else str(v) for k, v in payload.items()}
+        return {}
+
+    def _parse_authorize_request(self, params: Dict[str, Any]) -> OAuthAuthorizeRequest:
+        response_type = (params.get("response_type") or "code").strip()
+        if response_type != "code":
+            raise ValueError("仅支持 response_type=code")
+
+        client_id = (params.get("client_id") or "").strip()
+        redirect_uri = (params.get("redirect_uri") or "").strip()
+        if not client_id or not redirect_uri:
+            raise ValueError("缺少 client_id 或 redirect_uri")
+        if not self._is_safe_redirect_uri(redirect_uri):
+            raise ValueError("redirect_uri 不安全或格式不正确")
+
+        code_challenge = (params.get("code_challenge") or "").strip()
+        if not code_challenge:
+            raise ValueError("缺少 code_challenge，必须启用 PKCE")
+        code_challenge_method = (params.get("code_challenge_method") or "S256").strip() or "S256"
+        if code_challenge_method not in {"S256", "plain"}:
+            raise ValueError("仅支持 S256 或 plain 的 PKCE challenge method")
+
+        scopes = self._normalize_requested_scopes(params.get("scope"))
+        return OAuthAuthorizeRequest(
+            client_id=client_id,
+            redirect_uri=redirect_uri,
+            state=(params.get("state") or "").strip() or None,
+            scopes=scopes,
+            code_challenge=code_challenge,
+            code_challenge_method=code_challenge_method,
+        )
+
+    def _normalize_requested_scopes(self, raw_scope: Optional[str]) -> List[str]:
+        if not raw_scope:
+            return self._default_scopes()
+        requested = [item.strip() for item in str(raw_scope).split() if item.strip()]
+        allowed = set(self._allowed_scopes())
+        if any(scope not in allowed for scope in requested):
+            raise ValueError("请求了不被允许的 scope")
+        if self._oauth_scopes[1] in requested and not self._enable_write_tools:
+            raise ValueError("当前插件未开启写操作工具，不能授予写操作 scope")
+        if not requested:
+            return self._default_scopes()
+        return requested
+
+    def _default_scopes(self) -> List[str]:
+        scopes = [self._oauth_scopes[0]]
+        if self._enable_write_tools:
+            scopes.append(self._oauth_scopes[1])
+        return scopes
+
+    def _allowed_scopes(self) -> Tuple[str, ...]:
+        if self._enable_write_tools:
+            return self._oauth_scopes
+        return (self._oauth_scopes[0],)
+
+    def _issue_authorization_code(
+        self, auth_request: OAuthAuthorizeRequest, admin: Dict[str, Any]
+    ) -> str:
+        store = self._load_oauth_store()
+        self._prune_oauth_store(store)
+        code = self._generate_token()
+        (store.setdefault("codes", {}))[code] = {
+            "client_id": auth_request.client_id,
+            "redirect_uri": auth_request.redirect_uri,
+            "subject": admin.get("subject"),
+            "username": admin.get("username"),
+            "scopes": auth_request.scopes,
+            "code_challenge": auth_request.code_challenge,
+            "code_challenge_method": auth_request.code_challenge_method,
+            "expires_at": self._now() + self._oauth_code_ttl,
+        }
+        self._save_oauth_store(store)
+        return code
+
+    def _issue_token_pair(
+        self,
+        client_id: str,
+        redirect_uri: str,
+        scopes: List[str],
+        subject: str,
+        username: str,
+    ) -> Dict[str, Any]:
+        store = self._load_oauth_store()
+        self._prune_oauth_store(store)
+
+        access_token = self._generate_token()
+        refresh_token = self._generate_token()
+        access_expires_at = self._now() + self._oauth_access_token_ttl
+        refresh_expires_at = self._now() + self._oauth_refresh_token_ttl
+
+        store.setdefault("access_tokens", {})[access_token] = {
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "subject": subject,
+            "username": username,
+            "scopes": scopes,
+            "expires_at": access_expires_at,
+        }
+        store.setdefault("refresh_tokens", {})[refresh_token] = {
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "subject": subject,
+            "username": username,
+            "scopes": scopes,
+            "expires_at": refresh_expires_at,
+        }
+        self._save_oauth_store(store)
+        return {
+            "access_token": access_token,
+            "token_type": "Bearer",
+            "expires_in": self._oauth_access_token_ttl,
+            "refresh_token": refresh_token,
+            "scope": self._format_scope(scopes),
+        }
+
+    def _load_oauth_store(self) -> Dict[str, Any]:
+        data = self.get_data("oauth_store") or {}
+        return {
+            "codes": dict(data.get("codes") or {}),
+            "access_tokens": dict(data.get("access_tokens") or {}),
+            "refresh_tokens": dict(data.get("refresh_tokens") or {}),
+        }
+
+    def _save_oauth_store(self, store: Dict[str, Any]) -> None:
+        self.save_data("oauth_store", store)
+
+    def _prune_oauth_store(self, store: Dict[str, Any]) -> None:
+        now = self._now()
+        for bucket in ("codes", "access_tokens", "refresh_tokens"):
+            values = store.get(bucket) or {}
+            expired = [key for key, item in values.items() if (item or {}).get("expires_at", 0) < now]
+            for key in expired:
+                values.pop(key, None)
+
+    def _challenge_headers(
+        self, error: Optional[str] = None, description: Optional[str] = None
+    ) -> Dict[str, str]:
+        parts = [
+            'Bearer realm="moviepilot-mcp"',
+            f'resource_metadata="{self._build_resource_metadata_url()}"',
+            f'scope="{self._format_scope(self._allowed_scopes())}"',
+        ]
+        if error:
+            parts.append(f'error="{self._escape_auth_header(error)}"')
+        if description:
+            parts.append(
+                f'error_description="{self._escape_auth_header(description)}"'
+            )
+        return {"WWW-Authenticate": ", ".join(parts)}
+
+    def _get_logged_in_admin(self, request: Request) -> Optional[Dict[str, Any]]:
         authorization = request.headers.get("authorization") or ""
         if authorization.startswith("Bearer "):
-            token = authorization.split(" ", 1)[1].strip()
-        else:
-            token = (request.query_params.get("mcp_token") or "").strip()
+            payload = self._decode_moviepilot_token(
+                authorization.split(" ", 1)[1].strip(),
+                purpose="authentication",
+            )
+            if payload and payload.get("super_user"):
+                return {
+                    "subject": str(payload.get("sub")),
+                    "username": payload.get("username") or "admin",
+                }
 
+        resource_token = request.cookies.get(settings.PROJECT_NAME)
+        if resource_token:
+            payload = self._decode_moviepilot_token(resource_token, purpose="resource")
+            if payload and payload.get("super_user"):
+                return {
+                    "subject": str(payload.get("sub")),
+                    "username": payload.get("username") or "admin",
+                }
+        return None
+
+    def _decode_moviepilot_token(self, token: str, purpose: str) -> Optional[Dict[str, Any]]:
         if not token:
-            raise HTTPException(status_code=401, detail="缺少 MCP token")
-        if token != expected:
-            raise HTTPException(status_code=403, detail="MCP token 无效")
+            return None
+        secret = settings.RESOURCE_SECRET_KEY if purpose == "resource" else settings.SECRET_KEY
+        try:
+            payload = jwt.decode(token, secret, algorithms=["HS256"])
+        except Exception:
+            return None
+        if payload.get("purpose") != purpose:
+            return None
+        return payload
+
+    def _verify_pkce(self, code_verifier: str, code_challenge: str, method: str) -> bool:
+        if method == "plain":
+            return code_verifier == code_challenge
+        digest = hashlib.sha256(code_verifier.encode("utf-8")).digest()
+        expected = base64.urlsafe_b64encode(digest).decode("utf-8").rstrip("=")
+        return expected == code_challenge
+
+    def _oauth_error_response(self, error: str, description: str, status_code: int):
+        return JSONResponse(
+            {"error": error, "error_description": description},
+            status_code=status_code,
+        )
+
+    def _oauth_redirect_error(
+        self,
+        redirect_uri: str,
+        error: str,
+        description: str,
+        state: Optional[str],
+    ):
+        params = {"error": error, "error_description": description}
+        if state:
+            params["state"] = state
+        return RedirectResponse(self._append_query_params(redirect_uri, params), status_code=302)
+
+    def _render_authorize_page(
+        self, auth_request: OAuthAuthorizeRequest, admin: Dict[str, Any]
+    ) -> str:
+        safe_client = html.escape(auth_request.client_id)
+        safe_redirect = html.escape(auth_request.redirect_uri)
+        safe_scope = html.escape(self._format_scope(auth_request.scopes))
+        safe_user = html.escape(admin.get("username") or "admin")
+        action_url = html.escape(self._build_authorization_url())
+        hidden_fields = "\n".join(
+            [
+                self._hidden_field("response_type", "code"),
+                self._hidden_field("client_id", auth_request.client_id),
+                self._hidden_field("redirect_uri", auth_request.redirect_uri),
+                self._hidden_field("state", auth_request.state or ""),
+                self._hidden_field("scope", self._format_scope(auth_request.scopes)),
+                self._hidden_field("code_challenge", auth_request.code_challenge),
+                self._hidden_field("code_challenge_method", auth_request.code_challenge_method),
+            ]
+        )
+        return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MoviePilot MCP 授权</title>
+  <style>
+    body {{ font-family: sans-serif; background: #f5f7fb; color: #1f2937; margin: 0; padding: 24px; }}
+    .card {{ max-width: 720px; margin: 0 auto; background: #fff; border-radius: 16px; padding: 28px; box-shadow: 0 12px 30px rgba(15, 23, 42, 0.08); }}
+    h1 {{ margin-top: 0; font-size: 24px; }}
+    .meta {{ background: #f8fafc; border-radius: 12px; padding: 16px; margin: 16px 0; }}
+    .meta p {{ margin: 8px 0; word-break: break-all; }}
+    .hint {{ color: #475569; }}
+    .actions {{ display: flex; gap: 12px; margin-top: 24px; }}
+    button {{ border: 0; border-radius: 10px; padding: 12px 18px; font-size: 15px; cursor: pointer; }}
+    .approve {{ background: #0f766e; color: #fff; }}
+    .deny {{ background: #e2e8f0; color: #0f172a; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>授权 ChatGPT 访问 MoviePilot MCP</h1>
+    <p class="hint">你当前以管理员 <strong>{safe_user}</strong> 身份登录。批准后，客户端会通过 OAuth 2.0 Authorization Code + PKCE 获取访问令牌。</p>
+    <div class="meta">
+      <p><strong>客户端：</strong>{safe_client}</p>
+      <p><strong>回调地址：</strong>{safe_redirect}</p>
+      <p><strong>申请范围：</strong>{safe_scope}</p>
+    </div>
+    <form method="post" action="{action_url}">
+      {hidden_fields}
+      <div class="actions">
+        <button class="approve" type="submit" name="action" value="approve">批准授权</button>
+        <button class="deny" type="submit" name="action" value="deny">拒绝</button>
+      </div>
+    </form>
+  </div>
+</body>
+</html>"""
+
+    def _render_login_required_page(self, auth_request: OAuthAuthorizeRequest) -> str:
+        safe_scope = html.escape(self._format_scope(auth_request.scopes))
+        return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MoviePilot MCP 授权</title>
+  <style>
+    body {{ font-family: sans-serif; background: #f8fafc; color: #1e293b; margin: 0; padding: 24px; }}
+    .card {{ max-width: 720px; margin: 0 auto; background: #fff; border-radius: 16px; padding: 28px; box-shadow: 0 12px 30px rgba(15, 23, 42, 0.08); }}
+    p {{ line-height: 1.6; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>需要先登录 MoviePilot</h1>
+    <p>当前浏览器没有检测到 MoviePilot 管理员登录态，因此暂时不能批准 OAuth 授权。</p>
+    <p>请先在同一浏览器中登录 MoviePilot 管理界面，再刷新当前页面继续授权。</p>
+    <p>本次申请范围：<strong>{safe_scope}</strong></p>
+  </div>
+</body>
+</html>"""
+
+    def _render_authorize_error(self, message: str) -> str:
+        safe_message = html.escape(message)
+        return f"""<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>MoviePilot MCP 授权错误</title></head>
+<body style="font-family:sans-serif;padding:24px;background:#f8fafc;color:#1e293b;">
+  <div style="max-width:720px;margin:0 auto;background:#fff;border-radius:16px;padding:28px;box-shadow:0 12px 30px rgba(15,23,42,0.08);">
+    <h1>授权请求无效</h1>
+    <p>{safe_message}</p>
+  </div>
+</body>
+</html>"""
+
+    def _hidden_field(self, name: str, value: str) -> str:
+        return (
+            f'<input type="hidden" name="{html.escape(name)}" '
+            f'value="{html.escape(value)}">'
+        )
+
+    def _append_query_params(self, url: str, params: Dict[str, Any]) -> str:
+        parsed = urlparse(url)
+        query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        for key, value in params.items():
+            if value is not None:
+                query[key] = str(value)
+        return urlunparse(parsed._replace(query=urlencode(query)))
+
+    def _is_safe_redirect_uri(self, redirect_uri: str) -> bool:
+        parsed = urlparse(redirect_uri)
+        if not parsed.scheme:
+            return False
+        if parsed.scheme.lower() in {"javascript", "data", "file"}:
+            return False
+        if parsed.scheme.lower() in {"http", "https"}:
+            return bool(parsed.netloc)
+        return True
+
+    @staticmethod
+    def _escape_auth_header(value: str) -> str:
+        return value.replace("\\", "\\\\").replace('"', '\\"')
+
+    @staticmethod
+    def _now() -> int:
+        return int(time.time())
+
+    @staticmethod
+    def _format_scope(scopes: List[str] | Tuple[str, ...]) -> str:
+        return " ".join(scopes)
 
     def _available_tools(self) -> Dict[str, MCPTool]:
         tools = {}
@@ -631,21 +1375,21 @@ class MoviePilotMCP(_PluginBase):
         offset_schema = {"type": "integer", "minimum": 0, "default": 0}
 
         self._register_agent_tool(
-            "dashboard.summary",
+            "dashboard_summary",
             "获取系统统计、存储、下载器、调度、CPU 和内存摘要。",
             self._schema({}),
             internal_names=["query_dashboard_summary", "query_dashboard", "query_system_summary"],
             fallback_handler=self._fallback_dashboard_summary,
         )
         self._register_agent_tool(
-            "dashboard.processes",
+            "dashboard_processes",
             "获取 MoviePilot 所在主机的进程概览。",
             self._schema({"limit": limit_schema, "offset": offset_schema}),
             internal_names=["query_processes", "query_dashboard_processes"],
             fallback_handler=self._fallback_dashboard_processes,
         )
         self._register_agent_tool(
-            "media.search",
+            "media_search",
             "搜索媒体、合集或人物信息。",
             self._schema(
                 {
@@ -668,7 +1412,7 @@ class MoviePilotMCP(_PluginBase):
             result_mapper=self._postprocess_paginated_result,
         )
         self._register_agent_tool(
-            "media.detail",
+            "media_detail",
             "按媒体 ID 获取媒体详情。",
             self._schema(
                 {
@@ -682,7 +1426,7 @@ class MoviePilotMCP(_PluginBase):
             arg_mapper=self._map_media_detail,
         )
         self._register_agent_tool(
-            "media.recognize",
+            "media_recognize",
             "根据标题副标题或文件路径识别媒体信息。",
             self._schema(
                 {
@@ -694,7 +1438,7 @@ class MoviePilotMCP(_PluginBase):
             internal_names=["recognize_media"],
         )
         self._register_agent_tool(
-            "media.seasons",
+            "media_seasons",
             "查询电视剧季信息。",
             self._schema(
                 {
@@ -709,7 +1453,7 @@ class MoviePilotMCP(_PluginBase):
             result_mapper=self._map_media_seasons_result,
         )
         self._register_agent_tool(
-            "media.discover",
+            "media_discover",
             "浏览探索内容源。",
             self._schema(
                 {
@@ -723,7 +1467,7 @@ class MoviePilotMCP(_PluginBase):
             arg_mapper=self._map_recommendation_like,
         )
         self._register_agent_tool(
-            "media.recommend",
+            "media_recommend",
             "浏览推荐内容源。",
             self._schema(
                 {
@@ -737,7 +1481,7 @@ class MoviePilotMCP(_PluginBase):
             arg_mapper=self._map_recommendation_like,
         )
         self._register_agent_tool(
-            "subscribe.list",
+            "subscribe_list",
             "查询订阅列表。",
             self._schema(
                 {
@@ -755,14 +1499,14 @@ class MoviePilotMCP(_PluginBase):
             result_mapper=self._postprocess_paginated_result,
         )
         self._register_agent_tool(
-            "subscribe.detail",
+            "subscribe_detail",
             "按订阅 ID 获取订阅详情。",
             self._schema({"subscribe_id": {"type": "integer"}}, required=["subscribe_id"]),
             internal_names=["query_subscribe_detail", "get_subscribe_detail"],
             arg_mapper=self._map_subscribe_detail,
         )
         self._register_agent_tool(
-            "subscribe.create",
+            "subscribe_create",
             "新增订阅。",
             self._schema(
                 {
@@ -787,7 +1531,7 @@ class MoviePilotMCP(_PluginBase):
             is_write=True,
         )
         self._register_agent_tool(
-            "subscribe.update",
+            "subscribe_update",
             "更新订阅。",
             self._schema(
                 {
@@ -801,7 +1545,7 @@ class MoviePilotMCP(_PluginBase):
             is_write=True,
         )
         self._register_agent_tool(
-            "subscribe.set_state",
+            "subscribe_set_state",
             "更新订阅状态。",
             self._schema(
                 {
@@ -815,7 +1559,7 @@ class MoviePilotMCP(_PluginBase):
             is_write=True,
         )
         self._register_agent_tool(
-            "subscribe.refresh",
+            "subscribe_refresh",
             "刷新订阅或 TMDB 信息。",
             self._schema({"mode": {"type": "string", "enum": ["all", "tmdb"], "default": "all"}}),
             internal_names=["run_scheduler", "refresh_subscribes"],
@@ -823,7 +1567,7 @@ class MoviePilotMCP(_PluginBase):
             is_write=True,
         )
         self._register_agent_tool(
-            "subscribe.search",
+            "subscribe_search",
             "触发搜索全部订阅或指定订阅。",
             self._schema({"subscribe_id": {"type": "integer"}}),
             internal_names=["search_subscribe", "run_scheduler"],
@@ -831,7 +1575,7 @@ class MoviePilotMCP(_PluginBase):
             is_write=True,
         )
         self._register_agent_tool(
-            "download.list",
+            "download_list",
             "查看当前下载任务。",
             self._schema(
                 {
@@ -852,13 +1596,13 @@ class MoviePilotMCP(_PluginBase):
             result_mapper=self._postprocess_paginated_result,
         )
         self._register_agent_tool(
-            "download.clients",
+            "download_clients",
             "获取可用下载器列表。",
             self._schema({}),
             internal_names=["query_downloaders"],
         )
         self._register_agent_tool(
-            "download.add",
+            "download_add",
             "新增下载任务。",
             self._schema(
                 {
@@ -874,7 +1618,7 @@ class MoviePilotMCP(_PluginBase):
             is_write=True,
         )
         self._register_agent_tool(
-            "download.start",
+            "download_start",
             "开始下载任务。",
             self._schema(
                 {
@@ -888,7 +1632,7 @@ class MoviePilotMCP(_PluginBase):
             is_write=True,
         )
         self._register_agent_tool(
-            "download.stop",
+            "download_stop",
             "暂停下载任务。",
             self._schema(
                 {
@@ -902,7 +1646,7 @@ class MoviePilotMCP(_PluginBase):
             is_write=True,
         )
         self._register_agent_tool(
-            "history.download",
+            "history_download",
             "查询下载历史。",
             self._schema(
                 {
@@ -915,7 +1659,7 @@ class MoviePilotMCP(_PluginBase):
             result_mapper=self._postprocess_paginated_result,
         )
         self._register_agent_tool(
-            "history.transfer",
+            "history_transfer",
             "查询整理历史。",
             self._schema(
                 {
@@ -930,13 +1674,13 @@ class MoviePilotMCP(_PluginBase):
             result_mapper=self._postprocess_paginated_result,
         )
         self._register_agent_tool(
-            "mediaserver.clients",
+            "mediaserver_clients",
             "获取可用媒体服务器列表。",
             self._schema({}),
             internal_names=["query_mediaservers", "query_media_servers"],
         )
         self._register_agent_tool(
-            "mediaserver.library",
+            "mediaserver_library",
             "获取媒体库列表。",
             self._schema(
                 {"server": {"type": "string"}, "page": {"type": "integer", "minimum": 1, "default": 1}}
@@ -944,7 +1688,7 @@ class MoviePilotMCP(_PluginBase):
             internal_names=["query_library", "query_media_library"],
         )
         self._register_agent_tool(
-            "mediaserver.latest",
+            "mediaserver_latest",
             "获取最近入库内容。",
             self._schema(
                 {"server": {"type": "string"}, "page": {"type": "integer", "minimum": 1, "default": 1}}
@@ -952,7 +1696,7 @@ class MoviePilotMCP(_PluginBase):
             internal_names=["query_library_latest"],
         )
         self._register_agent_tool(
-            "mediaserver.playing",
+            "mediaserver_playing",
             "获取正在播放内容。",
             self._schema(
                 {"server": {"type": "string"}, "page": {"type": "integer", "minimum": 1, "default": 1}}
@@ -960,7 +1704,7 @@ class MoviePilotMCP(_PluginBase):
             internal_names=["query_library_playing", "query_now_playing"],
         )
         self._register_agent_tool(
-            "mediaserver.exists_local",
+            "mediaserver_exists_local",
             "查询媒体是否已存在于媒体服务器。",
             self._schema(
                 {
@@ -974,7 +1718,7 @@ class MoviePilotMCP(_PluginBase):
             arg_mapper=self._map_media_detail,
         )
         self._register_agent_tool(
-            "mediaserver.not_exists",
+            "mediaserver_not_exists",
             "查询媒体服务器缺失内容。",
             self._schema(
                 {
@@ -988,7 +1732,7 @@ class MoviePilotMCP(_PluginBase):
             arg_mapper=self._map_media_detail,
         )
         self._register_agent_tool(
-            "site.list",
+            "site_list",
             "查询站点列表。",
             self._schema(
                 {
@@ -1002,20 +1746,20 @@ class MoviePilotMCP(_PluginBase):
             result_mapper=self._postprocess_paginated_result,
         )
         self._register_agent_tool(
-            "site.detail",
+            "site_detail",
             "查询站点详情。",
             self._schema({"site_id": {"type": "integer"}}, required=["site_id"]),
             internal_names=["query_site_detail", "get_site_detail"],
         )
         self._register_agent_tool(
-            "site.test",
+            "site_test",
             "测试站点连通性。",
             self._schema({"site_id": {"type": "integer"}}, required=["site_id"]),
             internal_names=["test_site"],
             arg_mapper=lambda args: {"site_identifier": self._require(args, "site_id")},
         )
         self._register_agent_tool(
-            "site.resource",
+            "site_resource",
             "浏览站点资源。",
             self._schema(
                 {
@@ -1029,7 +1773,7 @@ class MoviePilotMCP(_PluginBase):
             internal_names=["query_site_resource", "search_torrents_for_site"],
         )
         self._register_agent_tool(
-            "site.userdata",
+            "site_userdata",
             "查询站点用户数据。",
             self._schema(
                 {
@@ -1044,7 +1788,7 @@ class MoviePilotMCP(_PluginBase):
             result_mapper=self._postprocess_paginated_result,
         )
         self._register_agent_tool(
-            "workflow.list",
+            "workflow_list",
             "查询工作流列表。",
             self._schema(
                 {
@@ -1059,13 +1803,13 @@ class MoviePilotMCP(_PluginBase):
             result_mapper=self._postprocess_paginated_result,
         )
         self._register_agent_tool(
-            "workflow.detail",
+            "workflow_detail",
             "查询工作流详情。",
             self._schema({"workflow_id": {"type": "integer"}}, required=["workflow_id"]),
             internal_names=["query_workflow_detail", "get_workflow_detail"],
         )
         self._register_agent_tool(
-            "workflow.create",
+            "workflow_create",
             "创建工作流。",
             self._schema(
                 {
@@ -1082,7 +1826,7 @@ class MoviePilotMCP(_PluginBase):
             is_write=True,
         )
         self._register_agent_tool(
-            "workflow.update",
+            "workflow_update",
             "更新工作流。",
             self._schema(
                 {
@@ -1095,7 +1839,7 @@ class MoviePilotMCP(_PluginBase):
             is_write=True,
         )
         self._register_agent_tool(
-            "workflow.run",
+            "workflow_run",
             "执行工作流。",
             self._schema(
                 {
@@ -1108,21 +1852,21 @@ class MoviePilotMCP(_PluginBase):
             is_write=True,
         )
         self._register_agent_tool(
-            "workflow.start",
+            "workflow_start",
             "启用工作流。",
             self._schema({"workflow_id": {"type": "integer"}}, required=["workflow_id"]),
             internal_names=["start_workflow"],
             is_write=True,
         )
         self._register_agent_tool(
-            "workflow.pause",
+            "workflow_pause",
             "停用工作流。",
             self._schema({"workflow_id": {"type": "integer"}}, required=["workflow_id"]),
             internal_names=["pause_workflow"],
             is_write=True,
         )
         self._register_agent_tool(
-            "plugin.list",
+            "plugin_list",
             "查询已安装插件列表。",
             self._schema({"limit": limit_schema, "offset": offset_schema}),
             internal_names=["query_installed_plugins"],
@@ -1130,21 +1874,21 @@ class MoviePilotMCP(_PluginBase):
             fallback_handler=self._fallback_plugin_list,
         )
         self._register_agent_tool(
-            "plugin.config",
+            "plugin_config",
             "读取指定插件配置。",
             self._schema({"plugin_id": {"type": "string"}}, required=["plugin_id"]),
             internal_names=[],
             fallback_handler=self._fallback_plugin_config,
         )
         self._register_agent_tool(
-            "plugin.page",
+            "plugin_page",
             "读取指定插件详情页数据。",
             self._schema({"plugin_id": {"type": "string"}}, required=["plugin_id"]),
             internal_names=[],
             fallback_handler=self._fallback_plugin_page,
         )
         self._register_agent_tool(
-            "plugin.reload",
+            "plugin_reload",
             "重新加载指定插件。",
             self._schema({"plugin_id": {"type": "string"}}, required=["plugin_id"]),
             internal_names=[],
@@ -1259,6 +2003,7 @@ class MoviePilotMCP(_PluginBase):
             "effect": args.get("effect"),
             "filter_groups": args.get("filter_groups"),
             "sites": args.get("sites"),
+            "username": self._actor_name,
         }
 
     def _map_subscribe_update(self, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1479,7 +2224,26 @@ class MoviePilotMCP(_PluginBase):
         return any(keyword in lowered for keyword in keywords)
 
     def _build_endpoint_url(self) -> str:
-        path = f"{settings.API_V1_STR}/plugin/{self.__class__.__name__}/mcp"
+        return self._absolute_url(self._plugin_api_path("/mcp"))
+
+    def _build_authorization_url(self) -> str:
+        return self._absolute_url(self._plugin_api_path("/oauth/authorize"))
+
+    def _build_token_url(self) -> str:
+        return self._absolute_url(self._plugin_api_path("/oauth/token"))
+
+    def _build_issuer_url(self) -> str:
+        return self._absolute_url(self._plugin_api_path("/oauth"))
+
+    def _build_resource_metadata_url(self) -> str:
+        return self._absolute_url(
+            self._plugin_api_path("/.well-known/oauth-protected-resource")
+        )
+
+    def _plugin_api_path(self, suffix: str = "") -> str:
+        return f"{settings.API_V1_STR}/plugin/{self.__class__.__name__}{suffix}"
+
+    def _absolute_url(self, path: str) -> str:
         if settings.APP_DOMAIN:
             # APP_DOMAIN 可能带有反向代理子路径，去掉前导斜杠以保留该前缀。
             return settings.MP_DOMAIN(path.lstrip("/"))
