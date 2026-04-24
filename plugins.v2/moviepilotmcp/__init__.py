@@ -85,7 +85,7 @@ class MoviePilotMCP(_PluginBase):
     plugin_name = "MoviePilot MCP Server"
     plugin_desc = "MoviePilot v2.10.4 的 ChatGPT 外部 MCP OAuth 包装层"
     plugin_icon = "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/moviepilotmcp.svg"
-    plugin_version = "0.3.2"
+    plugin_version = "0.3.3"
     plugin_author = "Codex"
     author_url = "https://wiki.movie-pilot.org/"
     plugin_config_prefix = "moviepilotmcp_"
@@ -184,6 +184,14 @@ class MoviePilotMCP(_PluginBase):
                 "methods": ["POST"],
                 "summary": "MoviePilot MCP OAuth token endpoint",
                 "description": "Authorization Code / Refresh Token 令牌交换入口",
+                "allow_anonymous": True,
+            },
+            {
+                "path": "/oauth/register",
+                "endpoint": self.handle_client_registration,
+                "methods": ["POST"],
+                "summary": "MoviePilot MCP OAuth dynamic client registration endpoint",
+                "description": "供 VS Code / ChatGPT 等 OAuth 客户端自动注册 public client",
                 "allow_anonymous": True,
             },
         ]
@@ -699,6 +707,7 @@ class MoviePilotMCP(_PluginBase):
                 "issuer": self._build_issuer_url(),
                 "authorization_endpoint": self._build_authorization_url(),
                 "token_endpoint": self._build_token_url(),
+                "registration_endpoint": self._build_registration_url(),
                 "response_types_supported": ["code"],
                 "grant_types_supported": ["authorization_code", "refresh_token"],
                 "code_challenge_methods_supported": ["S256", "plain"],
@@ -728,6 +737,61 @@ class MoviePilotMCP(_PluginBase):
             "unsupported_grant_type",
             "仅支持 authorization_code 和 refresh_token",
             status_code=400,
+        )
+
+    async def handle_client_registration(self, request: Request):
+        if not self._enabled:
+            raise HTTPException(status_code=403, detail="MoviePilot MCP 包装层未启用")
+
+        payload = await self._parse_json_request(request)
+        redirect_uris = payload.get("redirect_uris") or []
+        if not isinstance(redirect_uris, list) or not redirect_uris:
+            return self._oauth_error_response(
+                "invalid_client_metadata",
+                "redirect_uris 必须是非空数组",
+                status_code=400,
+            )
+        invalid_redirects = [
+            uri for uri in redirect_uris if not self._is_safe_redirect_uri(str(uri))
+        ]
+        if invalid_redirects:
+            return self._oauth_error_response(
+                "invalid_redirect_uri",
+                f"存在不合法的 redirect_uri: {invalid_redirects[0]}",
+                status_code=400,
+            )
+
+        client_name = str(payload.get("client_name") or "MoviePilot MCP Client").strip()
+        grant_types = payload.get("grant_types") or ["authorization_code", "refresh_token"]
+        response_types = payload.get("response_types") or ["code"]
+        token_endpoint_auth_method = str(
+            payload.get("token_endpoint_auth_method") or "none"
+        ).strip() or "none"
+        if token_endpoint_auth_method != "none":
+            return self._oauth_error_response(
+                "invalid_client_metadata",
+                "当前仅支持 public client（token_endpoint_auth_method=none）",
+                status_code=400,
+            )
+
+        client_id = self._register_oauth_client(
+            client_name=client_name,
+            redirect_uris=[str(uri) for uri in redirect_uris],
+            grant_types=[str(item) for item in grant_types],
+            response_types=[str(item) for item in response_types],
+        )
+        client_info = self._get_registered_client(client_id) or {}
+        return JSONResponse(
+            {
+                "client_id": client_id,
+                "client_id_issued_at": self._now(),
+                "client_name": client_info.get("client_name") or client_name,
+                "redirect_uris": client_info.get("redirect_uris") or redirect_uris,
+                "grant_types": client_info.get("grant_types") or grant_types,
+                "response_types": client_info.get("response_types") or response_types,
+                "token_endpoint_auth_method": "none",
+            },
+            status_code=201,
         )
 
     def _handle_authorize_get(self, request: Request):
@@ -922,6 +986,8 @@ class MoviePilotMCP(_PluginBase):
             raise ValueError("缺少 client_id 或 redirect_uri")
         if not self._is_safe_redirect_uri(redirect_uri):
             raise ValueError("redirect_uri 不安全或格式不正确")
+        if not self._client_allows_redirect_uri(client_id, redirect_uri):
+            raise ValueError("redirect_uri 未在该 client_id 的注册信息中")
 
         code_challenge = (params.get("code_challenge") or "").strip()
         if not code_challenge:
@@ -1027,6 +1093,7 @@ class MoviePilotMCP(_PluginBase):
     def _load_oauth_store(self) -> Dict[str, Any]:
         data = self.get_data("oauth_store") or {}
         return {
+            "clients": dict(data.get("clients") or {}),
             "codes": dict(data.get("codes") or {}),
             "access_tokens": dict(data.get("access_tokens") or {}),
             "refresh_tokens": dict(data.get("refresh_tokens") or {}),
@@ -1042,6 +1109,48 @@ class MoviePilotMCP(_PluginBase):
             expired = [key for key, item in values.items() if (item or {}).get("expires_at", 0) < now]
             for key in expired:
                 values.pop(key, None)
+
+    async def _parse_json_request(self, request: Request) -> Dict[str, Any]:
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        if isinstance(payload, dict):
+            return payload
+        return {}
+
+    def _register_oauth_client(
+        self,
+        client_name: str,
+        redirect_uris: List[str],
+        grant_types: List[str],
+        response_types: List[str],
+    ) -> str:
+        store = self._load_oauth_store()
+        client_id = self._generate_token()
+        store.setdefault("clients", {})[client_id] = {
+            "client_name": client_name,
+            "redirect_uris": redirect_uris,
+            "grant_types": grant_types or ["authorization_code", "refresh_token"],
+            "response_types": response_types or ["code"],
+            "token_endpoint_auth_method": "none",
+            "created_at": self._now(),
+        }
+        self._save_oauth_store(store)
+        return client_id
+
+    def _get_registered_client(self, client_id: str) -> Optional[Dict[str, Any]]:
+        if not client_id:
+            return None
+        store = self._load_oauth_store()
+        return (store.get("clients") or {}).get(client_id)
+
+    def _client_allows_redirect_uri(self, client_id: str, redirect_uri: str) -> bool:
+        client = self._get_registered_client(client_id)
+        if not client:
+            # 兼容之前的手工 client_id 模式；若已动态注册，则要求 redirect_uri 匹配注册值。
+            return True
+        return redirect_uri in (client.get("redirect_uris") or [])
 
     def _challenge_headers(
         self, error: Optional[str] = None, description: Optional[str] = None
@@ -2231,6 +2340,9 @@ class MoviePilotMCP(_PluginBase):
 
     def _build_token_url(self) -> str:
         return self._absolute_url(self._plugin_api_path("/oauth/token"))
+
+    def _build_registration_url(self) -> str:
+        return self._absolute_url(self._plugin_api_path("/oauth/register"))
 
     def _build_issuer_url(self) -> str:
         return self._absolute_url(self._plugin_api_path("/oauth"))
