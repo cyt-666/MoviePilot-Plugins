@@ -3,11 +3,12 @@
         "name": "MoviePilot MCP Server",
         "description": "MoviePilot v2.10.4 的 ChatGPT 外部 MCP 薄包装层",
         "labels": "MCP,ChatGPT,OpenAI,自动化,MoviePilot",
-        "version": "0.2.2",
+        "version": "0.2.3",
         "icon": "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/moviepilotmcp.svg",
         "author": "Codex",
         "level": 1,
         "history": {
+            "v0.2.3": "修复 MCP Token 配置项在插件表单中的显示问题，改为通过独立开关控制明文/隐藏，确保首次安装后可稳定查看和复制。",
             "v0.2.2": "为 MoviePilot MCP 插件更换专属图标，避免继续复用 Trakt 图标造成混淆。",
             "v0.2.1": "优化 ChatGPT MCP 包装层配置体验：修复带子路径反向代理时的 endpoint URL 展示，并为 MCP Token 增加显示/隐藏切换，便于复制到 VS Code 或 ChatGPT Connector。",
             "v0.2.0": "重构为 MoviePilot v2.10.4 的 ChatGPT 外部 MCP 薄包装层：优先复用内置 Agent 工具，仅负责鉴权、工具裁剪、参数映射、结果整形与风险收敛。",
