@@ -75,6 +75,7 @@ class OAuthAuthorizeRequest:
     scopes: List[str]
     code_challenge: str
     code_challenge_method: str
+    raw_scope: Optional[str] = None
 
 
 class MoviePilotMCP(_PluginBase):
@@ -85,7 +86,7 @@ class MoviePilotMCP(_PluginBase):
     plugin_name = "MoviePilot MCP Server"
     plugin_desc = "MoviePilot v2.10.4 的 ChatGPT 外部 MCP OAuth 包装层"
     plugin_icon = "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/moviepilotmcp.svg"
-    plugin_version = "0.3.8"
+    plugin_version = "0.3.10"
     plugin_author = "Codex"
     author_url = "https://wiki.movie-pilot.org/"
     plugin_config_prefix = "moviepilotmcp_"
@@ -101,7 +102,8 @@ class MoviePilotMCP(_PluginBase):
     # 插件独立管理员会话（仅服务于授权页），避免误用 MoviePilot 的 resource cookie
     # 作为登录态导致退出登录后依然能批准授权。
     _admin_session_cookie_name = "mp_mcp_admin_session"
-    _admin_session_ttl = 30 * 60
+    # 仅用于「批准授权」页的极短期会话；不影响已经拿到 access_token 的 client。
+    _admin_session_ttl = 2 * 60
     _agent_manager_candidates = [
         ("app.agent.tools.manager", "MoviePilotToolsManager"),
     ]
@@ -951,7 +953,10 @@ class MoviePilotMCP(_PluginBase):
                 "client_id": auth_request.client_id,
                 "redirect_uri": auth_request.redirect_uri,
                 "state": auth_request.state or "",
-                "scope": self._format_scope(auth_request.scopes),
+                # 回传客户端原始 scope 字符串（含未知 scope）而非过滤后的值，
+                # 避免 GET 重新解析时丢掉客户端的原始请求，最终 token 响应里
+                # 才能把原始 scope 原样回显，防止客户端提示「并非所有请求的权限都已授予」。
+                "scope": auth_request.raw_scope or self._format_scope(auth_request.scopes),
                 "code_challenge": auth_request.code_challenge,
                 "code_challenge_method": auth_request.code_challenge_method,
             },
@@ -1057,6 +1062,7 @@ class MoviePilotMCP(_PluginBase):
             scopes=code_info.get("scopes") or self._default_scopes(),
             subject=code_info.get("subject") or "admin",
             username=code_info.get("username") or "admin",
+            requested_scope=code_info.get("requested_scope"),
         )
         return JSONResponse(token_payload)
 
@@ -1087,6 +1093,7 @@ class MoviePilotMCP(_PluginBase):
             scopes=refresh_info.get("scopes") or self._default_scopes(),
             subject=refresh_info.get("subject") or "admin",
             username=refresh_info.get("username") or "admin",
+            requested_scope=refresh_info.get("requested_scope"),
         )
         return JSONResponse(token_payload)
 
@@ -1171,7 +1178,8 @@ class MoviePilotMCP(_PluginBase):
         if code_challenge_method not in {"S256", "plain"}:
             raise ValueError("仅支持 S256 或 plain 的 PKCE challenge method")
 
-        scopes = self._normalize_requested_scopes(params.get("scope"))
+        raw_scope = (params.get("scope") or "").strip() or None
+        scopes = self._normalize_requested_scopes(raw_scope)
         return OAuthAuthorizeRequest(
             client_id=client_id,
             redirect_uri=redirect_uri,
@@ -1179,6 +1187,7 @@ class MoviePilotMCP(_PluginBase):
             scopes=scopes,
             code_challenge=code_challenge,
             code_challenge_method=code_challenge_method,
+            raw_scope=raw_scope,
         )
 
     def _normalize_requested_scopes(self, raw_scope: Optional[str]) -> List[str]:
@@ -1219,6 +1228,7 @@ class MoviePilotMCP(_PluginBase):
             "subject": admin.get("subject"),
             "username": admin.get("username"),
             "scopes": auth_request.scopes,
+            "requested_scope": auth_request.raw_scope,
             "code_challenge": auth_request.code_challenge,
             "code_challenge_method": auth_request.code_challenge_method,
             "expires_at": self._now() + self._oauth_code_ttl,
@@ -1233,6 +1243,7 @@ class MoviePilotMCP(_PluginBase):
         scopes: List[str],
         subject: str,
         username: str,
+        requested_scope: Optional[str] = None,
     ) -> Dict[str, Any]:
         store = self._load_oauth_store()
         self._prune_oauth_store(store)
@@ -1248,6 +1259,7 @@ class MoviePilotMCP(_PluginBase):
             "subject": subject,
             "username": username,
             "scopes": scopes,
+            "requested_scope": requested_scope,
             "expires_at": access_expires_at,
         }
         store.setdefault("refresh_tokens", {})[refresh_token] = {
@@ -1256,15 +1268,20 @@ class MoviePilotMCP(_PluginBase):
             "subject": subject,
             "username": username,
             "scopes": scopes,
+            "requested_scope": requested_scope,
             "expires_at": refresh_expires_at,
         }
         self._save_oauth_store(store)
+        # 为了避免 ChatGPT / VS Code 等客户端因「授予的 scope 不等于请求的 scope」
+        # 而弹出「并非所有请求的权限都已授予」警告，若客户端传了 scope，
+        # 就原样回显请求的 scope 字符串；服务端内部权限校验仍基于过滤后的 scopes。
+        response_scope = requested_scope.strip() if requested_scope and requested_scope.strip() else self._format_scope(scopes)
         return {
             "access_token": access_token,
             "token_type": "Bearer",
             "expires_in": self._oauth_access_token_ttl,
             "refresh_token": refresh_token,
-            "scope": self._format_scope(scopes),
+            "scope": response_scope,
         }
 
     def _load_oauth_store(self) -> Dict[str, Any]:
@@ -1442,7 +1459,7 @@ class MoviePilotMCP(_PluginBase):
                 self._hidden_field("client_id", auth_request.client_id),
                 self._hidden_field("redirect_uri", auth_request.redirect_uri),
                 self._hidden_field("state", auth_request.state or ""),
-                self._hidden_field("scope", self._format_scope(auth_request.scopes)),
+                self._hidden_field("scope", auth_request.raw_scope or self._format_scope(auth_request.scopes)),
                 self._hidden_field("code_challenge", auth_request.code_challenge),
                 self._hidden_field("code_challenge_method", auth_request.code_challenge_method),
             ]
@@ -1501,7 +1518,7 @@ class MoviePilotMCP(_PluginBase):
                 self._hidden_field("client_id", auth_request.client_id),
                 self._hidden_field("redirect_uri", auth_request.redirect_uri),
                 self._hidden_field("state", auth_request.state or ""),
-                self._hidden_field("scope", self._format_scope(auth_request.scopes)),
+                self._hidden_field("scope", auth_request.raw_scope or self._format_scope(auth_request.scopes)),
                 self._hidden_field("code_challenge", auth_request.code_challenge),
                 self._hidden_field("code_challenge_method", auth_request.code_challenge_method),
             ]
