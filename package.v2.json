@@ -1,4 +1,17 @@
 {
+    "MoviePilotMCP": {
+        "name": "MoviePilot MCP Server",
+        "description": "MoviePilot v2.10.4 的 ChatGPT 外部 MCP 薄包装层",
+        "labels": "MCP,ChatGPT,OpenAI,自动化,MoviePilot",
+        "version": "0.2.0",
+        "icon": "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/trakt.png",
+        "author": "Codex",
+        "level": 1,
+        "history": {
+            "v0.2.0": "重构为 MoviePilot v2.10.4 的 ChatGPT 外部 MCP 薄包装层：优先复用内置 Agent 工具，仅负责鉴权、工具裁剪、参数映射、结果整形与风险收敛。",
+            "v0.1.0": "首版发布：内嵌 HTTP MCP Server，提供 MoviePilot 常用查询与安全写操作 tools。"
+        }
+    },
     "TraktSync": {
         "name": "Trakt WatchList 同步",
         "description": "Trakt WatchList 同步",
