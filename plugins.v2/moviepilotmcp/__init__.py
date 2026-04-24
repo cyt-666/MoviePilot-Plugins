@@ -63,8 +63,8 @@ class MoviePilotMCP(_PluginBase):
 
     plugin_name = "MoviePilot MCP Server"
     plugin_desc = "MoviePilot v2.10.4 的 ChatGPT 外部 MCP 薄包装层"
-    plugin_icon = "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/trakt.png"
-    plugin_version = "0.2.1"
+    plugin_icon = "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/moviepilotmcp.svg"
+    plugin_version = "0.2.2"
     plugin_author = "Codex"
     author_url = "https://wiki.movie-pilot.org/"
     plugin_config_prefix = "moviepilotmcp_"
