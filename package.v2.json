@@ -55,11 +55,12 @@
         "name": "媒体库封面生成",
         "description": "生成媒体库动态/静态封面，支持 Emby/Jellyfin",
         "labels": "媒体库,封面,Emby,Jellyfin",
-        "version": "0.9.7",
+        "version": "0.9.8",
         "icon": "mediaplay.png",
         "author": "cyt-666",
         "level": 1,
         "history": {
+            "v0.9.8": "修复 Emby/Jellyfin 媒体库封面接口需要 Base64 文本的问题，并修正 4xx 响应被日志误判为 No response 的问题。",
             "v0.9.7": "修复封面写回媒体服务器时错误上传 base64 文本的问题，改为上传图片二进制数据，并补充媒体服务器响应日志。",
             "v0.9.6": "接管维护版本：修复字体下载未使用 MoviePilot 代理配置、旧字体配置升级兼容、字体失效时生成无文字封面，以及静态样式文字绘制问题。"
         }

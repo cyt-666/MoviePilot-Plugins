@@ -54,7 +54,7 @@ class MediaCoverGenerator(_PluginBase):
     # 插件图标
     plugin_icon = "mediaplay.png"
     # 插件版本
-    plugin_version = "0.9.7"
+    plugin_version = "0.9.8"
     # 插件作者
     plugin_author = "cyt-666"
     # 作者主页
@@ -4019,7 +4019,8 @@ class MediaCoverGenerator(_PluginBase):
         """设置Emby媒体库封面"""
         try:
             try:
-                image_bytes = base64.b64decode(image_base64)
+                normalized_base64 = "".join(str(image_base64).split())
+                image_bytes = base64.b64decode(normalized_base64)
             except Exception as decode_err:
                 logger.error(f"设置「{library['Name']}」封面失败，图片数据base64解码失败：{decode_err}")
                 return False
@@ -4055,13 +4056,13 @@ class MediaCoverGenerator(_PluginBase):
             
             res = service.instance.post_data(
                 url=url,
-                data=image_bytes,
+                data=normalized_base64,
                 headers={
                     "Content-Type": content_type
                 }
             )
             
-            if res and res.status_code in [200, 204]:
+            if res is not None and res.status_code in [200, 204]:
                 logger.info(f"设置「{library['Name']}」封面成功，媒体服务器返回状态码：{res.status_code}")
                 return True
             else:
@@ -4072,7 +4073,7 @@ class MediaCoverGenerator(_PluginBase):
                     except Exception:
                         response_text = "<无法读取响应内容>"
                 logger.error(
-                    f"设置「{library['Name']}」封面失败，错误码：{res.status_code if res else 'No response'}，"
+                    f"设置「{library['Name']}」封面失败，错误码：{res.status_code if res is not None else 'No response'}，"
                     f"响应：{response_text}"
                 )
                 return False
