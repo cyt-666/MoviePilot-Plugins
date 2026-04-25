@@ -441,6 +441,10 @@ def create_style_static_2(image_path, title, font_path, font_size=(170,75), font
         # 中文标题位置
         zh_x = left_area_center_x - zh_text_w // 2
         zh_y = total_text_y + float(zh_font_offset)
+        logger.info(
+            f"static_2 文字绘制: title='{title_zh}', canvas={canvas_size}, "
+            f"font=({zh_font_size}, {en_font_size}), pos=({zh_x}, {zh_y}), size=({zh_text_w}, {zh_text_h})"
+        )
 
         # 中文标题阴影效果
         for offset in range(3, shadow_offset + 1, 2):

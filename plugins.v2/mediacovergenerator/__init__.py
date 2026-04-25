@@ -54,7 +54,7 @@ class MediaCoverGenerator(_PluginBase):
     # 插件图标
     plugin_icon = "mediaplay.png"
     # 插件版本
-    plugin_version = "0.9.8"
+    plugin_version = "0.9.10"
     # 插件作者
     plugin_author = "cyt-666"
     # 作者主页
@@ -339,6 +339,24 @@ class MediaCoverGenerator(_PluginBase):
             return clamped
 
         return parsed
+
+    @staticmethod
+    def __get_library_item_id(library: dict) -> Optional[str]:
+        """
+        媒体库封面接口需要 VirtualFolder 的 ItemId。
+        Emby 的 VirtualFolders/Query 同时返回 Id 和 ItemId，Id 不是客户端展示封面使用的项目ID。
+        """
+        if not library:
+            return None
+        return library.get("ItemId") or library.get("Id")
+
+    @staticmethod
+    def __library_selection_matched(server: str, library: dict, selected_libraries: List[str]) -> bool:
+        if not selected_libraries:
+            return True
+        candidate_ids = {library.get("ItemId"), library.get("Id")}
+        candidate_ids.discard(None)
+        return any(f"{server}-{library_id}" in selected_libraries for library_id in candidate_ids)
 
     def __get_animated_2_required_items(self) -> int:
         self._animated_2_image_count = self.__clamp_value(
@@ -2821,11 +2839,8 @@ class MediaCoverGenerator(_PluginBase):
         if not library:
             logger.warning(f"找不到 {mediainfo.title_year} 所在媒体库")
             return
-        if service.type == 'emby':
-            library_id = library.get("Id")
-        else:
-            library_id = library.get("ItemId")
-        if self._include_libraries and f"{server}-{library_id}" not in self._include_libraries:
+        library_id = self.__get_library_item_id(library)
+        if not self.__library_selection_matched(server, library, self._include_libraries):
             logger.info(f"{server}：{library['Name']} 不在列表中，跳过更新封面")
             return
 
@@ -2909,11 +2924,8 @@ class MediaCoverGenerator(_PluginBase):
                     logger.info("媒体库封面更新服务停止")
                     self._event.clear()
                     return
-                if service.type == 'emby':
-                    library_id = library.get("Id")
-                else:
-                    library_id = library.get("ItemId")
-                if self._include_libraries and f"{server}-{library_id}" not in self._include_libraries:
+                library_id = self.__get_library_item_id(library)
+                if not self.__library_selection_matched(server, library, self._include_libraries):
                     logger.info(f"{server}：{library['Name']} 不在列表中，跳过更新封面")
                     continue
                 if self.__update_library(service, library):
@@ -2940,6 +2952,9 @@ class MediaCoverGenerator(_PluginBase):
         else:
             title = title_result
             config_bg_color = None
+        if not title or not str(title[0]).strip():
+            logger.warning(f"媒体库 {service.name}：{library_name} 主标题为空，回退为媒体库名称")
+            title = (library_name, title[1] if title and len(title) > 1 else "")
         if image_path:
             logger.info(f"媒体库 {service.name}：{library_name} 从自定义路径获取封面")
             image_data = self.__generate_image_from_path(service.name, library_name, title, image_path[0], config_bg_color)
@@ -3016,6 +3031,17 @@ class MediaCoverGenerator(_PluginBase):
             zh_font_size = self._resolution_config.get_font_size(base_zh_font_size) * title_scale
             en_font_size = self._resolution_config.get_font_size(base_en_font_size) * title_scale
 
+        # 避免历史配置中的极小 title_scale / 字号导致文字实际绘制但肉眼不可见。
+        min_zh_font_size = max(24, int(self._resolution_config.height * 0.08))
+        min_en_font_size = max(12, int(self._resolution_config.height * 0.035))
+        if not self._cover_style.startswith("animated"):
+            if zh_font_size < min_zh_font_size:
+                logger.warning(f"主标题字号过小 ({zh_font_size})，已提升到最小可见字号 {min_zh_font_size}")
+                zh_font_size = min_zh_font_size
+            if en_font_size < min_en_font_size:
+                logger.warning(f"副标题字号过小 ({en_font_size})，已提升到最小可见字号 {min_en_font_size}")
+                en_font_size = min_en_font_size
+
         blur_size = self._blur_size or 50
         color_ratio = self._color_ratio or 0.8
 
@@ -3050,6 +3076,10 @@ class MediaCoverGenerator(_PluginBase):
 
         # 记录分辨率配置信息
         logger.info(f"当前分辨率配置: {self._resolution_config}")
+        logger.info(
+            f"文字配置: 主标题='{title[0]}', 副标题='{title[1]}', "
+            f"字号=({font_size[0]}, {font_size[1]}), 偏移={font_offset}, 缩放={title_scale}"
+        )
 
         # 准备背景颜色配置
         bg_color_config = {
@@ -3239,10 +3269,7 @@ class MediaCoverGenerator(_PluginBase):
         max_attempts = 20  # 最大尝试次数，防止无限循环
         
         library_type = library.get('CollectionType')
-        if service.type == 'emby':
-            library_id = library.get("Id")
-        else:
-            library_id = library.get("ItemId")
+        library_id = self.__get_library_item_id(library)
         parent_id = library_id
         
         # 处理合集类型的特殊情况
@@ -3305,10 +3332,7 @@ class MediaCoverGenerator(_PluginBase):
     def __handle_boxset_library(self, service, library, title):
 
         include_types = 'BoxSet,Movie'
-        if service.type == 'emby':
-            library_id = library.get("Id")
-        else:
-            library_id = library.get("ItemId")
+        library_id = self.__get_library_item_id(library)
         parent_id = library_id
         boxsets = self.__get_items_batch(service, parent_id,
                                       include_types=include_types)
@@ -3354,10 +3378,7 @@ class MediaCoverGenerator(_PluginBase):
         播放列表图片获取 
         """
         include_types = 'Playlist,Movie,Series,Episode,Audio'
-        if service.type == 'emby':
-            library_id = library.get("Id")
-        else:
-            library_id = library.get("ItemId")
+        library_id = self.__get_library_item_id(library)
         parent_id = library_id
         playlists = self.__get_items_batch(service, parent_id,
                                       include_types=include_types)
@@ -3526,10 +3547,7 @@ class MediaCoverGenerator(_PluginBase):
             
         if not image_data:
             return False
-        if service.type == 'emby':
-            library_id = library.get("Id")
-        else:
-            library_id = library.get("ItemId")
+        library_id = self.__get_library_item_id(library)
         # 更新id
         self.update_cover_history(
             server=service.name, 
@@ -3567,10 +3585,7 @@ class MediaCoverGenerator(_PluginBase):
         image_data = self.__generate_image_from_path(service.name, library['Name'], title, None, config_bg_color)
         if not image_data:
             return False
-        if service.type == 'emby':
-            library_id = library.get("Id")
-        else:
-            library_id = library.get("ItemId")
+        library_id = self.__get_library_item_id(library)
         # 更新ids
         for item_id in reversed(updated_item_ids):
             self.update_cover_history(
@@ -3725,10 +3740,7 @@ class MediaCoverGenerator(_PluginBase):
             lib_items = []
             libraries = self.__get_server_libraries(service)
             for library in libraries:
-                if service.type == 'emby':
-                    library_id = library.get("Id")
-                else:
-                    library_id = library.get("ItemId")
+                library_id = self.__get_library_item_id(library)
                 if library['Name'] and library_id:
                     lib_item = {
                         "name": f"{server}: {library['Name']}",
@@ -4025,12 +4037,10 @@ class MediaCoverGenerator(_PluginBase):
                 logger.error(f"设置「{library['Name']}」封面失败，图片数据base64解码失败：{decode_err}")
                 return False
 
-            if service.type == 'emby':
-                library_id = library.get("Id")
-            else:
-                library_id = library.get("ItemId")
+            library_id = self.__get_library_item_id(library)
             
             url = f'[HOST]emby/Items/{library_id}/Images/Primary?api_key=[APIKEY]'
+            logger.info(f"设置「{library['Name']}」封面目标媒体库ItemId：{library_id}")
             # 根据 base64 前几个字节简单判断格式
             content_type = "image/png"
             extension = "png"
