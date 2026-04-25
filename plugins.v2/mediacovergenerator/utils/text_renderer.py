@@ -16,8 +16,19 @@ def _core_to_image(core) -> Optional[Image.Image]:
     width, height = core.size
     if width <= 0 or height <= 0:
         return None
-    data = core.tobytes() if hasattr(core, "tobytes") else bytes(core)
-    return Image.frombytes("L", (width, height), data)
+    try:
+        image = Image.Image()._new(core)
+    except Exception:
+        mode = getattr(core, "mode", "L") or "L"
+        data = core.tobytes() if hasattr(core, "tobytes") else bytes(core)
+        image = Image.frombytes(mode, (width, height), data)
+    if image.mode == "L":
+        return image
+    if image.mode in ("1", "P"):
+        return image.convert("L")
+    if image.mode in ("LA", "RGBA"):
+        return image.getchannel("A")
+    return image.convert("L")
 
 
 def text_to_mask(font, text: str) -> Tuple[Optional[Image.Image], Tuple[int, int]]:
