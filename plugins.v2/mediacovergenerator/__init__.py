@@ -54,7 +54,7 @@ class MediaCoverGenerator(_PluginBase):
     # 插件图标
     plugin_icon = "mediaplay.png"
     # 插件版本
-    plugin_version = "0.9.6"
+    plugin_version = "0.9.7"
     # 插件作者
     plugin_author = "cyt-666"
     # 作者主页
@@ -4018,6 +4018,12 @@ class MediaCoverGenerator(_PluginBase):
 
         """设置Emby媒体库封面"""
         try:
+            try:
+                image_bytes = base64.b64decode(image_base64)
+            except Exception as decode_err:
+                logger.error(f"设置「{library['Name']}」封面失败，图片数据base64解码失败：{decode_err}")
+                return False
+
             if service.type == 'emby':
                 library_id = library.get("Id")
             else:
@@ -4043,23 +4049,32 @@ class MediaCoverGenerator(_PluginBase):
             # 在发送前保存一份图片到本地
             if self._save_recent_covers:
                 try:
-                    image_bytes = base64.b64decode(image_base64)
                     self.__save_image_to_local(image_bytes, service.name, library['Name'], extension)
                 except Exception as save_err:
                     logger.error(f"保存发送前图片失败: {str(save_err)}")
             
             res = service.instance.post_data(
                 url=url,
-                data=image_base64,
+                data=image_bytes,
                 headers={
                     "Content-Type": content_type
                 }
             )
             
             if res and res.status_code in [200, 204]:
+                logger.info(f"设置「{library['Name']}」封面成功，媒体服务器返回状态码：{res.status_code}")
                 return True
             else:
-                logger.error(f"设置「{library['Name']}」封面失败，错误码：{res.status_code if res else 'No response'}")
+                response_text = ""
+                if res is not None:
+                    try:
+                        response_text = res.text[:500]
+                    except Exception:
+                        response_text = "<无法读取响应内容>"
+                logger.error(
+                    f"设置「{library['Name']}」封面失败，错误码：{res.status_code if res else 'No response'}，"
+                    f"响应：{response_text}"
+                )
                 return False
         except Exception as err:
             logger.error(f"设置「{library['Name']}」封面失败：{str(err)}")
