@@ -1,7 +1,22 @@
 # MoviePilot-Plugins
 MoviePilot插件市场：https://github.com/cyt-666/MoviePilot-Plugins
 
-## 说明
+## 插件列表
+
+### MoviePilot MCP Server
+
+将 MoviePilot v2.10.4 的内置 Agent 工具通过 **OAuth 2.0 + MCP（Model Context Protocol）** 暴露给 ChatGPT、VS Code Copilot、Claude 等 AI 客户端。
+
+- 完整 OAuth 2.0 授权码流程 + PKCE，支持动态客户端注册
+- 转发至 MoviePilot 内置MCP，覆盖全部 51 个工具
+- 可一键关闭写操作工具，保护媒体库安全
+
+详见 [plugins.v2/moviepilotmcp/README.md](plugins.v2/moviepilotmcp/README.md)
+
+---
+
+### Trakt 同步
+
 因为个人追剧app用的是trakt，并且emby和plex可以同步库和播放信息到trakt。
 因此参考豆瓣同步插件写了这个trakt同步插件，当前只有一个功能，就是将trakt的watch list添加到MP的订阅里。
 
