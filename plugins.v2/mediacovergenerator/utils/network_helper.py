@@ -207,13 +207,14 @@ class NetworkHelper:
         return False
 
 
-def validate_font_file(font_path: Path, sample_text: Optional[str] = None) -> bool:
+def validate_font_file(font_path: Path, sample_text: Optional[str] = None, strict_render: bool = False) -> bool:
     """
     验证字体文件是否有效
 
     Args:
         font_path: 字体文件路径
-        sample_text: 可选的示例文字；传入后会验证字体能实际渲染出可见像素
+        sample_text: 可选的示例文字；传入后会额外诊断字体是否能实际渲染出可见像素
+        strict_render: 是否将示例文字不可见视为字体无效
 
     Returns:
         bool: 字体文件是否有效
@@ -229,12 +230,15 @@ def validate_font_file(font_path: Path, sample_text: Optional[str] = None) -> bo
             bbox = font.getbbox(sample_text)
             text_w = max(1, bbox[2] - bbox[0])
             text_h = max(1, bbox[3] - bbox[1])
-            test_img = Image.new("L", (text_w + 32, text_h + 32), 0)
+            test_img = Image.new("RGBA", (text_w + 32, text_h + 32), (0, 0, 0, 0))
             draw = ImageDraw.Draw(test_img)
-            draw.text((16 - bbox[0], 16 - bbox[1]), sample_text, font=font, fill=255)
-            if not test_img.getbbox():
-                logger.warning(f"字体文件无法渲染示例文字: {font_path}, sample={sample_text}")
-                return False
+            draw.text((16 - bbox[0], 16 - bbox[1]), sample_text, font=font, fill=(255, 255, 255, 255))
+            if not test_img.getchannel("A").getbbox():
+                message = f"字体文件示例文字渲染不可见: {font_path}, sample={sample_text}"
+                if strict_render:
+                    logger.warning(message)
+                    return False
+                logger.debug(f"{message}，已降级为仅校验字体可加载")
         return True
     except Exception as e:
         logger.warning(f"字体文件验证失败: {font_path}, 错误: {e}")

@@ -54,7 +54,7 @@ class MediaCoverGenerator(_PluginBase):
     # 插件图标
     plugin_icon = "mediaplay.png"
     # 插件版本
-    plugin_version = "0.9.11"
+    plugin_version = "0.9.12"
     # 插件作者
     plugin_author = "cyt-666"
     # 作者主页
@@ -4297,7 +4297,8 @@ class MediaCoverGenerator(_PluginBase):
         default_font_url = {
             "chaohei": "https://raw.githubusercontent.com/justzerock/MoviePilot-Plugins/main/fonts/chaohei.ttf",
             "yasong": "https://raw.githubusercontent.com/justzerock/MoviePilot-Plugins/main/fonts/yasong.ttf",
-            "EmblemaOne": "https://raw.githubusercontent.com/justzerock/MoviePilot-Plugins/main/fonts/EmblemaOne.woff2",
+            # WOFF2 在部分 Pillow/FreeType 环境中能加载但渲染异常，默认改用 OTF 兼容字体。
+            "EmblemaOne": "https://raw.githubusercontent.com/justzerock/MoviePilot-Plugins/main/fonts/Melete.otf",
             "Melete": "https://raw.githubusercontent.com/justzerock/MoviePilot-Plugins/main/fonts/Melete.otf",
             "Phosphate": "https://raw.githubusercontent.com/justzerock/MoviePilot-Plugins/main/fonts/phosphate.ttf",
             "JosefinSans": "https://raw.githubusercontent.com/justzerock/MoviePilot-Plugins/main/fonts/josefinsans.woff2",
@@ -4310,7 +4311,7 @@ class MediaCoverGenerator(_PluginBase):
         if not self._en_font_preset:
             self._en_font_preset = "EmblemaOne"
 
-        default_en_url = default_font_url.get(self._en_font_preset, "https://raw.githubusercontent.com/justzerock/MoviePilot-Plugins/main/fonts/EmblemaOne.woff2")
+        default_en_url = default_font_url.get(self._en_font_preset, "https://raw.githubusercontent.com/justzerock/MoviePilot-Plugins/main/fonts/Melete.otf")
         
         log_prefix = "默认"
         # 兼容旧版本配置：早期版本保存 zh_font_url/en_font_url，新版 UI 使用 *_font_custom。
@@ -4322,6 +4323,14 @@ class MediaCoverGenerator(_PluginBase):
         current_en_font_url = en_font_source if en_custom_type == 'url' else default_en_url
         zh_local_path_config = zh_font_source if zh_custom_type == 'path' else zh_preset_paths.get(self._zh_font_preset)
         en_local_path_config = en_font_source if en_custom_type == 'path' else en_preset_paths.get(self._en_font_preset)
+        if (
+            self._en_font_preset == "EmblemaOne"
+            and en_custom_type != "path"
+            and en_local_path_config
+            and Path(en_local_path_config).suffix.lower() == ".woff2"
+        ):
+            logger.info("默认副标题字体忽略旧 WOFF2 缓存，将改用 OTF 兼容字体")
+            en_local_path_config = None
 
         downloaded_zh_font_base = f"{self._zh_font_preset}_custom" if zh_custom_type == 'url' else self._zh_font_preset
         downloaded_en_font_base = f"{self._en_font_preset}_custom" if en_custom_type == 'url' else self._en_font_preset
