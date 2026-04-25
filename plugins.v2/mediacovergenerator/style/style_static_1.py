@@ -17,7 +17,7 @@ from app.plugins.mediacovergenerator.utils.performance_helper import (
     OptimizedImageProcessor, PerformanceMonitor, memory_efficient_operation
 )
 from app.plugins.mediacovergenerator.utils.color_helper import ColorHelper
-from app.plugins.mediacovergenerator.utils.text_renderer import draw_text_with_mask
+from app.plugins.mediacovergenerator.utils.text_renderer import draw_text_with_mask, draw_text_with_fallback
 
 
 # ========== 配置 ==========
@@ -643,7 +643,9 @@ def create_style_static_1(image_path, title, font_path, font_size=(170,75), font
             stroke_width=zh_stroke_width, stroke_fill=direct_shadow_color
         )
         if not direct_bbox:
-            logger.error(f"static_1 主标题最终掩码渲染失败: title='{title_zh}', font={zh_font_path}")
+            logger.warning(f"static_1 主标题 FreeType 掩码渲染失败，降级使用 PIL text: title='{title_zh}', font={zh_font_path}")
+            draw_text_with_fallback(combined, (zh_x, zh_y), title_zh, zh_font, direct_text_color,
+                                    stroke_width=zh_stroke_width, stroke_fill=direct_shadow_color)
         if en_lines:
             en_y = zh_y + zh_text_h + title_spacing
             for i, line in enumerate(en_lines):
@@ -657,7 +659,9 @@ def create_style_static_1(image_path, title, font_path, font_size=(170,75), font
                     stroke_width=en_stroke_width, stroke_fill=direct_shadow_color
                 )
                 if not direct_en_bbox:
-                    logger.error(f"static_1 副标题最终掩码渲染失败: title='{line}', font={en_font_path}")
+                    logger.warning(f"static_1 副标题 FreeType 掩码渲染失败，降级使用 PIL text: title='{line}', font={en_font_path}")
+                    draw_text_with_fallback(combined, (en_x, current_y), line, en_font, direct_text_color,
+                                            stroke_width=en_stroke_width, stroke_fill=direct_shadow_color)
 
         # 转为 RGB
         # rgb_image = combined.convert("RGB")

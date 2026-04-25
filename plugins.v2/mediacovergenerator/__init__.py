@@ -54,7 +54,7 @@ class MediaCoverGenerator(_PluginBase):
     # 插件图标
     plugin_icon = "mediaplay.png"
     # 插件版本
-    plugin_version = "0.9.15"
+    plugin_version = "0.9.16"
     # 插件作者
     plugin_author = "cyt-666"
     # 作者主页
@@ -3050,7 +3050,7 @@ class MediaCoverGenerator(_PluginBase):
             if not font_path:
                 return False
             try:
-                return validate_font_file(Path(font_path), sample_text=sample_text, strict_render=True)
+                return validate_font_file(Path(font_path), sample_text=sample_text)
             except Exception:
                 return False
 
@@ -4494,11 +4494,11 @@ class MediaCoverGenerator(_PluginBase):
                 self.__get_fonts()
 
             # 验证字体文件有效性
-            if self._zh_font_path and not validate_font_file(Path(self._zh_font_path), sample_text="媒体库", strict_render=True):
+            if self._zh_font_path and not validate_font_file(Path(self._zh_font_path), sample_text="媒体库"):
                 logger.warning("主标题字体文件无效，尝试重新下载")
                 return False
 
-            if self._en_font_path and not validate_font_file(Path(self._en_font_path), sample_text="MoviePilot", strict_render=True):
+            if self._en_font_path and not validate_font_file(Path(self._en_font_path), sample_text="MoviePilot"):
                 logger.warning("副标题字体文件无效，尝试重新下载")
                 return False
 

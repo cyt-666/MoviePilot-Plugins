@@ -1,6 +1,6 @@
 from typing import Optional, Sequence, Tuple
 
-from PIL import Image, ImageFilter, ImageOps
+from PIL import Image, ImageDraw, ImageFilter, ImageOps
 
 
 Color = Tuple[int, int, int, int]
@@ -94,3 +94,27 @@ def draw_text_with_mask(
         return None
 
     return x, y, x + mask.width, y + mask.height
+
+
+def draw_text_with_fallback(
+    target: Image.Image,
+    position: Tuple[float, float],
+    text: str,
+    font,
+    fill: Sequence[int],
+    stroke_width: int = 0,
+    stroke_fill: Optional[Sequence[int]] = None,
+) -> bool:
+    """Try FreeType mask rendering first, fall back to ImageDraw.text if it fails."""
+    result = draw_text_with_mask(target, position, text, font, fill, stroke_width, stroke_fill)
+    if result is not None:
+        return True
+
+    draw = ImageDraw.Draw(target)
+    x, y = int(round(position[0])), int(round(position[1]))
+    if stroke_width > 0 and stroke_fill is not None:
+        draw.text((x, y), text, font=font, fill=fill,
+                  stroke_width=stroke_width, stroke_fill=stroke_fill)
+    else:
+        draw.text((x, y), text, font=font, fill=fill)
+    return True
