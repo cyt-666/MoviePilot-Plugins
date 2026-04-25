@@ -51,6 +51,18 @@
             "v0.1.0": "Trakt WatchList 同步第一版"
         }
     },
+    "MediaCoverGenerator": {
+        "name": "媒体库封面生成",
+        "description": "生成媒体库动态/静态封面，支持 Emby/Jellyfin",
+        "labels": "媒体库,封面,Emby,Jellyfin",
+        "version": "0.9.6",
+        "icon": "mediaplay.png",
+        "author": "cyt-666",
+        "level": 1,
+        "history": {
+            "v0.9.6": "接管维护版本：修复字体下载未使用 MoviePilot 代理配置、旧字体配置升级兼容、字体失效时生成无文字封面，以及静态样式文字绘制问题。"
+        }
+    },
     "mediamsgwithdeletemsg": {
         "name": "媒体库服务器通知AI版(支持删除消息)",
         "description": "媒体库服务器通知AI版的基础上加上媒体删除通知",
