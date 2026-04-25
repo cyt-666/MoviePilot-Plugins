@@ -224,16 +224,12 @@ def validate_font_file(font_path: Path, sample_text: Optional[str] = None, stric
             return False
 
         # 尝试加载字体文件
-        from PIL import Image, ImageDraw, ImageFont
+        from PIL import ImageFont
+        from app.plugins.mediacovergenerator.utils.text_renderer import text_to_mask
         font = ImageFont.truetype(str(font_path), 24)
         if sample_text:
-            bbox = font.getbbox(sample_text)
-            text_w = max(1, bbox[2] - bbox[0])
-            text_h = max(1, bbox[3] - bbox[1])
-            test_img = Image.new("RGBA", (text_w + 32, text_h + 32), (0, 0, 0, 0))
-            draw = ImageDraw.Draw(test_img)
-            draw.text((16 - bbox[0], 16 - bbox[1]), sample_text, font=font, fill=(255, 255, 255, 255))
-            if not test_img.getchannel("A").getbbox():
+            mask, _ = text_to_mask(font, sample_text)
+            if mask is None or not mask.getbbox():
                 message = f"字体文件示例文字渲染不可见: {font_path}, sample={sample_text}"
                 if strict_render:
                     logger.warning(message)

@@ -11,6 +11,7 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 from app.log import logger
 from app.plugins.mediacovergenerator.utils.color_helper import ColorHelper
+from app.plugins.mediacovergenerator.utils.text_renderer import draw_text_with_mask
 
 # ========== 配置 ==========
 canvas_size = (1920, 1080)
@@ -449,10 +450,10 @@ def create_style_static_2(image_path, title, font_path, font_size=(170,75), font
         # 中文标题阴影效果
         for offset in range(3, shadow_offset + 1, 2):
             current_shadow_color = shadow_color[:3] + (shadow_alpha,)
-            shadow_draw.text((zh_x + offset, zh_y + offset), title_zh, font=zh_font, fill=current_shadow_color)
+            draw_text_with_mask(shadow_layer, (zh_x + offset, zh_y + offset), title_zh, zh_font, current_shadow_color)
         
         # 中文标题
-        draw.text((zh_x, zh_y), title_zh, font=zh_font, fill=text_color)
+        draw_text_with_mask(text_layer, (zh_x, zh_y), title_zh, zh_font, text_color)
 
         if en_lines:
             # 英文标题起始位置
@@ -471,10 +472,10 @@ def create_style_static_2(image_path, title, font_path, font_size=(170,75), font
                 # 英文标题阴影效果
                 for offset in range(2, shadow_offset // 2 + 1):
                     current_shadow_color = shadow_color[:3] + (shadow_alpha,)
-                    shadow_draw.text((en_x + offset, current_y + offset), line, font=en_font, fill=current_shadow_color)
+                    draw_text_with_mask(shadow_layer, (en_x + offset, current_y + offset), line, en_font, current_shadow_color)
                 
                 # 英文标题
-                draw.text((en_x, current_y), line, font=en_font, fill=text_color)
+                draw_text_with_mask(text_layer, (en_x, current_y), line, en_font, text_color)
         
         blurred_shadow = shadow_layer.filter(ImageFilter.GaussianBlur(radius=shadow_offset))
         text_alpha_bbox = text_layer.getchannel("A").getbbox()
@@ -485,35 +486,30 @@ def create_style_static_2(image_path, title, font_path, font_size=(170,75), font
         combined = Image.alpha_composite(combined, text_layer)
 
         # 最终图上再直接压一遍不透明文字，避免透明图层在部分 Pillow/字体组合下被吞掉。
-        final_draw = ImageDraw.Draw(combined)
         zh_stroke_width = max(1, int(float(zh_font_size) * 0.04))
         en_stroke_width = max(1, int(float(en_font_size) * 0.04))
         direct_shadow_color = shadow_color[:3] + (180,)
         direct_text_color = (255, 255, 255, 255)
-        final_draw.text(
-            (zh_x, zh_y),
-            title_zh,
-            font=zh_font,
-            fill=direct_text_color,
-            stroke_width=zh_stroke_width,
-            stroke_fill=direct_shadow_color
+        direct_bbox = draw_text_with_mask(
+            combined, (zh_x, zh_y), title_zh, zh_font, direct_text_color,
+            stroke_width=zh_stroke_width, stroke_fill=direct_shadow_color
         )
+        if not direct_bbox:
+            logger.error(f"static_2 主标题最终掩码渲染失败: title='{title_zh}', font={zh_font_path}")
         if en_lines:
             en_y = zh_y + zh_text_h + title_spacing
             for i, line in enumerate(en_lines):
-                line_bbox = final_draw.textbbox((0, 0), line, font=en_font)
+                line_bbox = en_font.getbbox(line)
                 line_width = line_bbox[2] - line_bbox[0]
                 line_height = line_bbox[3] - line_bbox[1]
                 en_x = left_area_center_x - line_width // 2
                 current_y = en_y + i * (line_height + en_line_spacing)
-                final_draw.text(
-                    (en_x, current_y),
-                    line,
-                    font=en_font,
-                    fill=direct_text_color,
-                    stroke_width=en_stroke_width,
-                    stroke_fill=direct_shadow_color
+                direct_en_bbox = draw_text_with_mask(
+                    combined, (en_x, current_y), line, en_font, direct_text_color,
+                    stroke_width=en_stroke_width, stroke_fill=direct_shadow_color
                 )
+                if not direct_en_bbox:
+                    logger.error(f"static_2 副标题最终掩码渲染失败: title='{line}', font={en_font_path}")
 
         def image_to_base64(image, format="auto", quality=85):
             buffer = BytesIO()
