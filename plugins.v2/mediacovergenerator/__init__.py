@@ -54,7 +54,7 @@ class MediaCoverGenerator(_PluginBase):
     # 插件图标
     plugin_icon = "mediaplay.png"
     # 插件版本
-    plugin_version = "0.9.10"
+    plugin_version = "0.9.11"
     # 插件作者
     plugin_author = "cyt-666"
     # 作者主页
@@ -3046,23 +3046,23 @@ class MediaCoverGenerator(_PluginBase):
         color_ratio = self._color_ratio or 0.8
 
         # 字体路径可能来自旧配置或被用户清理过；生成前再强制刷新一次，避免静默生成无文字封面。
-        def is_valid_font_path(font_path):
+        def is_valid_font_path(font_path, sample_text):
             if not font_path:
                 return False
             try:
-                return validate_font_file(Path(font_path))
+                return validate_font_file(Path(font_path), sample_text=sample_text)
             except Exception:
                 return False
 
-        if not is_valid_font_path(self._zh_font_path) or not is_valid_font_path(self._en_font_path):
+        if not is_valid_font_path(self._zh_font_path, "媒体库") or not is_valid_font_path(self._en_font_path, "MoviePilot"):
             logger.warning("字体路径未设置或无效，尝试重新获取字体")
             self.__get_fonts()
 
-        if not is_valid_font_path(self._zh_font_path):
+        if not is_valid_font_path(self._zh_font_path, "媒体库"):
             logger.error(f"主标题字体文件无效，无法生成带文字封面: {self._zh_font_path}")
             return False
 
-        if not is_valid_font_path(self._en_font_path):
+        if not is_valid_font_path(self._en_font_path, "MoviePilot"):
             logger.error(f"副标题字体文件无效，无法生成带文字封面: {self._en_font_path}")
             return False
 
@@ -4362,6 +4362,7 @@ class MediaCoverGenerator(_PluginBase):
             hash_filename = font_info["hash_file_name"]
             final_attr = font_info["final_attr_name"]
             fallback_ext = font_info["fallback_ext"]
+            sample_text = "媒体库" if lang == "主标题" else "MoviePilot"
 
 
             extension = self.get_file_extension_from_url(url, fallback_ext=fallback_ext)
@@ -4372,7 +4373,7 @@ class MediaCoverGenerator(_PluginBase):
             using_local_font = False
             if local_path_cfg:
                 local_font_p = Path(local_path_cfg)
-                if validate_font_file(local_font_p):
+                if validate_font_file(local_font_p, sample_text=sample_text):
                     logger.info(f"{lang}字体: 使用本地指定路径 {local_font_p}")
                     current_font_path = local_font_p
                     using_local_font = True
@@ -4389,7 +4390,7 @@ class MediaCoverGenerator(_PluginBase):
                     except Exception as e:
                         logger.warning(f"读取哈希文件失败 {hash_file_path}: {e}。将重新下载。")
                 
-                font_file_is_valid = validate_font_file(downloaded_font_file_path)
+                font_file_is_valid = validate_font_file(downloaded_font_file_path, sample_text=sample_text)
 
                 if url_has_changed or not font_file_is_valid:
                     if url_has_changed:
@@ -4400,7 +4401,7 @@ class MediaCoverGenerator(_PluginBase):
                          logger.info(f"{log_prefix}{lang}字体文件 {downloaded_font_file_path} 不存在，将下载。")
 
                     # 使用安全的字体下载方法
-                    if self.download_font_safely_with_timeout(url, downloaded_font_file_path):
+                    if self.download_font_safely_with_timeout(url, downloaded_font_file_path, sample_text=sample_text):
                         try:
                             hash_file_path.write_text(url_hash)
                         except Exception as e:
@@ -4484,11 +4485,11 @@ class MediaCoverGenerator(_PluginBase):
                 self.__get_fonts()
 
             # 验证字体文件有效性
-            if self._zh_font_path and not validate_font_file(Path(self._zh_font_path)):
+            if self._zh_font_path and not validate_font_file(Path(self._zh_font_path), sample_text="媒体库"):
                 logger.warning("主标题字体文件无效，尝试重新下载")
                 return False
 
-            if self._en_font_path and not validate_font_file(Path(self._en_font_path)):
+            if self._en_font_path and not validate_font_file(Path(self._en_font_path), sample_text="MoviePilot"):
                 logger.warning("副标题字体文件无效，尝试重新下载")
                 return False
 
@@ -4499,19 +4500,19 @@ class MediaCoverGenerator(_PluginBase):
             logger.error(f"健康检查失败: {e}")
             return False
 
-    def download_font_safely_with_timeout(self, font_url: str, font_path: Path, timeout: int = 60) -> bool:
+    def download_font_safely_with_timeout(self, font_url: str, font_path: Path, timeout: int = 60, sample_text: str = None) -> bool:
         """
         带超时的安全字体下载方法，避免首次下载时阻塞过久
         """
         try:
             logger.info(f"开始下载字体（超时限制: {timeout}秒）: {font_url}")
-            return self.download_font_safely(font_url, font_path, retries=1, timeout=timeout)
+            return self.download_font_safely(font_url, font_path, retries=1, timeout=timeout, sample_text=sample_text)
 
         except Exception as e:
             logger.error(f"字体下载过程中出现异常: {e}")
             return False
 
-    def download_font_safely(self, font_url: str, font_path: Path, retries: int = 2, timeout: int = 30):
+    def download_font_safely(self, font_url: str, font_path: Path, retries: int = 2, timeout: int = 30, sample_text: str = None):
         """
         从链接下载字体文件到指定目录，使用优化的网络助手
         :param font_url: 字体文件URL
@@ -4559,7 +4560,7 @@ class MediaCoverGenerator(_PluginBase):
                 # 使用网络助手下载
                 if network_helper.download_file_sync(target_url, temp_path):
                     # 验证下载的字体文件
-                    if validate_font_file(temp_path):
+                    if validate_font_file(temp_path, sample_text=sample_text):
                         # 验证通过后，将临时文件移动到正确位置
                         temp_path.replace(font_path)
                         logger.info(f"字体下载成功: 使用策略 {strategy_name}")

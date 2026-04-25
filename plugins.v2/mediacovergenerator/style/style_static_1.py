@@ -625,9 +625,43 @@ def create_style_static_1(image_path, title, font_path, font_size=(170,75), font
                 draw.text((en_x, current_y), line, font=en_font, fill=text_color)
 
         blurred_shadow = shadow_layer.filter(ImageFilter.GaussianBlur(radius=shadow_offset))
+        text_alpha_bbox = text_layer.getchannel("A").getbbox()
+        if not text_alpha_bbox:
+            logger.warning("static_1 文字图层未产生可见像素，将使用最终图直绘兜底")
         combined = Image.alpha_composite(canvas, blurred_shadow)
         # 合并所有图层
         combined = Image.alpha_composite(combined, text_layer)
+
+        # 最终图上再直接压一遍不透明文字，避免透明图层在部分 Pillow/字体组合下被吞掉。
+        final_draw = ImageDraw.Draw(combined)
+        zh_stroke_width = max(1, int(float(zh_font_size) * 0.04))
+        en_stroke_width = max(1, int(float(en_font_size) * 0.04))
+        direct_shadow_color = shadow_color[:3] + (180,)
+        direct_text_color = (255, 255, 255, 255)
+        final_draw.text(
+            (zh_x, zh_y),
+            title_zh,
+            font=zh_font,
+            fill=direct_text_color,
+            stroke_width=zh_stroke_width,
+            stroke_fill=direct_shadow_color
+        )
+        if en_lines:
+            en_y = zh_y + zh_text_h + title_spacing
+            for i, line in enumerate(en_lines):
+                line_bbox = final_draw.textbbox((0, 0), line, font=en_font)
+                line_width = line_bbox[2] - line_bbox[0]
+                line_height = line_bbox[3] - line_bbox[1]
+                en_x = left_area_center_x - line_width // 2
+                current_y = en_y + i * (line_height + en_line_spacing)
+                final_draw.text(
+                    (en_x, current_y),
+                    line,
+                    font=en_font,
+                    fill=direct_text_color,
+                    stroke_width=en_stroke_width,
+                    stroke_fill=direct_shadow_color
+                )
 
         # 转为 RGB
         # rgb_image = combined.convert("RGB")
