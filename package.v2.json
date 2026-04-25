@@ -3,11 +3,12 @@
         "name": "MoviePilot MCP Server",
         "description": "MoviePilot v2.10.4 的 ChatGPT 外部 MCP OAuth 包装层",
         "labels": "MCP,ChatGPT,OpenAI,自动化,MoviePilot",
-        "version": "0.3.10",
+        "version": "0.4.0",
         "icon": "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/moviepilotmcp.svg",
         "author": "Codex",
         "level": 1,
         "history": {
+            "v0.4.0": "架构重构：将 MCP 工具调度层从自定义 AgentToolBinding 映射引擎改为直接透传至 MoviePilot v2.10.4 内置 /api/v1/mcp，插件专注于 OAuth 2.0 AS 角色；工具覆盖率从约 30 个提升至内置 MCP 全量工具；写操作开关通过前端拦截和 tools/list 过滤实现。",
             "v0.3.10": "修复 ChatGPT 提示「并非所有请求的权限都已授予」的警告：在 token 响应中原样回显客户端请求的 scope 字符串（含未知 scope，如 openid），服务端内部权限校验仍基于用户启用的 scope。",
             "v0.3.9": "将授权页专用的管理员会话有效期从 30 分钟缩短为 2 分钟，过期后新客户端授权需重新输入 MoviePilot 账号密码；已发放的 access_token 不受影响。",
             "v0.3.8": "修复 ChatGPT 授权时提示「请求了不被允许的 scope」：按 RFC 6749 建议改为忽略未知 scope而不是直接拒绝，同时若未启用写操作则自动裁剪写操作 scope，提高对 ChatGPT / VS Code 等客户端的兼容性。",
