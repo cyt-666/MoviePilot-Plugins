@@ -11,6 +11,7 @@ import colorsys
 import traceback
 from app.log import logger
 from app.plugins.mediacovergenerator.utils.color_helper import ColorHelper
+from app.plugins.mediacovergenerator.utils.text_renderer import draw_text_with_mask
 
 """ 
 代码修改自 https://github.com/HappyQuQu/jellyfin-library-poster/blob/main/gen_poster.py
@@ -100,11 +101,9 @@ def draw_text_on_image(
     position = (int(round(float(position[0]))), int(round(float(position[1]))))
 
     # 创建一个可绘制的图像副本
-    img_copy = image.copy()
+    img_copy = image.convert("RGBA")
     text_layer = Image.new('RGBA', img_copy.size, (255, 255, 255, 0))
     shadow_layer = Image.new('RGBA', img_copy.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(text_layer)
-    shadow_draw = ImageDraw.Draw(shadow_layer)
     font_size = int(max(1, round(float(font_size))))
     shadow_offset = int(max(1, round(float(shadow_offset))))
     font = ImageFont.truetype(font_path, font_size)
@@ -130,14 +129,10 @@ def draw_text_on_image(
                 raise ValueError("shadow_color 格式不正确")  # 抛出异常，明确错误
 
         for offset in range(3, shadow_offset + 1, 2):
-            shadow_draw.text(
-                (position[0] + offset, position[1] + offset),
-                text,
-                font=font,
-                fill=shadow_color_with_alpha
-            )
+            draw_text_with_mask(shadow_layer, (position[0] + offset, position[1] + offset), text, font, shadow_color_with_alpha)
     # 绘制主文字
-    draw.text(position, text, font=font, fill=fill_color)
+    if not draw_text_with_mask(text_layer, position, text, font, fill_color):
+        raise ValueError(f"文字最终渲染失败: text='{text}', font={font_path}")
     blurred_shadow = shadow_layer.filter(ImageFilter.GaussianBlur(radius=shadow_offset))
     combined = Image.alpha_composite(img_copy, blurred_shadow)
     img_copy = Image.alpha_composite(combined, text_layer)
@@ -183,9 +178,8 @@ def draw_multiline_text_on_image(
     position = (int(round(float(position[0]))), int(round(float(position[1]))))
 
     # 创建一个可绘制的图像副本
-    img_copy = image.copy()
+    img_copy = image.convert("RGBA")
     text_layer = Image.new('RGBA', img_copy.size, (255, 255, 255, 0))
-    draw = ImageDraw.Draw(text_layer)
     font_size = int(max(1, round(float(font_size))))
     shadow_offset = int(max(1, round(float(shadow_offset))))
     line_spacing = int(round(float(line_spacing)))
@@ -221,13 +215,9 @@ def draw_multiline_text_on_image(
     if len(lines) <= 1 or not is_multiline:
         if shadow:
             for offset in range(3, shadow_offset + 1, 2):
-                draw.text(
-                    (position[0] + offset, position[1] + offset),
-                    text,
-                    font=font,
-                    fill=shadow_color_with_alpha
-                )
-        draw.text(position, text, font=font, fill=fill_color)
+                draw_text_with_mask(text_layer, (position[0] + offset, position[1] + offset), text, font, shadow_color_with_alpha)
+        if not draw_text_with_mask(text_layer, position, text, font, fill_color):
+            raise ValueError(f"文字最终渲染失败: text='{text}', font={font_path}")
         img_copy = Image.alpha_composite(img_copy, text_layer)
         return img_copy, 1
 
@@ -238,13 +228,9 @@ def draw_multiline_text_on_image(
 
         if shadow:
             for offset in range(3, shadow_offset + 1, 2):
-                draw.text(
-                    (x + offset, current_y + offset),
-                    line,
-                    font=font,
-                    fill=shadow_color_with_alpha
-                )
-        draw.text((x, current_y), line, font=font, fill=fill_color)
+                draw_text_with_mask(text_layer, (x + offset, current_y + offset), line, font, shadow_color_with_alpha)
+        if not draw_text_with_mask(text_layer, (x, current_y), line, font, fill_color):
+            raise ValueError(f"文字最终渲染失败: text='{line}', font={font_path}")
     img_copy = Image.alpha_composite(img_copy, text_layer)
     return img_copy, len(lines)
 

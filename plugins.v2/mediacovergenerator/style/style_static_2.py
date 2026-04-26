@@ -351,7 +351,6 @@ def create_style_static_2(image_path, title, font_path, font_size=(170,75), font
         text_layer = Image.new('RGBA', canvas_size, (255, 255, 255, 0))
         shadow_layer = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
 
-        shadow_draw = ImageDraw.Draw(shadow_layer)
         draw = ImageDraw.Draw(text_layer)
         
         # 计算左侧区域的中心 X 位置 (画布宽度的四分之一处)
@@ -496,8 +495,10 @@ def create_style_static_2(image_path, title, font_path, font_size=(170,75), font
         )
         if not direct_bbox:
             logger.warning(f"static_2 主标题 FreeType 掩码渲染失败，降级使用 PIL text: title='{title_zh}', font={zh_font_path}")
-            draw_text_with_fallback(combined, (zh_x, zh_y), title_zh, zh_font, direct_text_color,
-                                    stroke_width=zh_stroke_width, stroke_fill=direct_shadow_color)
+            if not draw_text_with_fallback(combined, (zh_x, zh_y), title_zh, zh_font, direct_text_color,
+                                           stroke_width=zh_stroke_width, stroke_fill=direct_shadow_color):
+                logger.error(f"static_2 主标题最终渲染失败，拒绝生成无字封面: title='{title_zh}', font={zh_font_path}")
+                return False
         if en_lines:
             en_y = zh_y + zh_text_h + title_spacing
             for i, line in enumerate(en_lines):
@@ -512,8 +513,9 @@ def create_style_static_2(image_path, title, font_path, font_size=(170,75), font
                 )
                 if not direct_en_bbox:
                     logger.warning(f"static_2 副标题 FreeType 掩码渲染失败，降级使用 PIL text: title='{line}', font={en_font_path}")
-                    draw_text_with_fallback(combined, (en_x, current_y), line, en_font, direct_text_color,
-                                            stroke_width=en_stroke_width, stroke_fill=direct_shadow_color)
+                    if not draw_text_with_fallback(combined, (en_x, current_y), line, en_font, direct_text_color,
+                                                   stroke_width=en_stroke_width, stroke_fill=direct_shadow_color):
+                        logger.error(f"static_2 副标题最终渲染失败: title='{line}', font={en_font_path}")
 
         def image_to_base64(image, format="auto", quality=85):
             buffer = BytesIO()

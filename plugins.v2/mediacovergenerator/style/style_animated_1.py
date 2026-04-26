@@ -13,6 +13,7 @@ from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 from app.log import logger
 from app.plugins.mediacovergenerator.utils.color_helper import ColorHelper
+from app.plugins.mediacovergenerator.utils.text_renderer import draw_text_with_mask
 
 
 def darken_color(color, factor=0.7):
@@ -205,7 +206,6 @@ def _build_text_layer(target_w, target_h, title, font_path, font_size, font_offs
     shadow_layer = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
 
     draw = ImageDraw.Draw(text_layer)
-    shadow_draw = ImageDraw.Draw(shadow_layer)
 
     zh_font_size, en_font_size = float(font_size[0]), float(font_size[1])
     zh_font_offset, title_spacing, _ = font_offset
@@ -270,9 +270,10 @@ def _build_text_layer(target_w, target_h, title, font_path, font_size, font_offs
 
     for offset in range(3, shadow_offset + 1, 2):
         current_shadow_color = shadow_color[:3] + (shadow_alpha,)
-        shadow_draw.text((zh_x + offset, zh_y + offset), title_zh, font=zh_font, fill=current_shadow_color)
+        draw_text_with_mask(shadow_layer, (zh_x + offset, zh_y + offset), title_zh, zh_font, current_shadow_color)
 
-    draw.text((zh_x, zh_y), title_zh, font=zh_font, fill=text_color)
+    if not draw_text_with_mask(text_layer, (zh_x, zh_y), title_zh, zh_font, text_color):
+        raise ValueError(f"animated_1 主标题最终渲染失败: title='{title_zh}', font={zh_font_path}")
 
     if en_lines:
         en_y = zh_y + zh_text_h + title_spacing_px
@@ -285,12 +286,16 @@ def _build_text_layer(target_w, target_h, title, font_path, font_size, font_offs
 
             for offset in range(2, max(3, shadow_offset // 2 + 1)):
                 current_shadow_color = shadow_color[:3] + (shadow_alpha,)
-                shadow_draw.text((en_x + offset, current_y + offset), line, font=en_font, fill=current_shadow_color)
+                draw_text_with_mask(shadow_layer, (en_x + offset, current_y + offset), line, en_font, current_shadow_color)
 
-            draw.text((en_x, current_y), line, font=en_font, fill=text_color)
+            if not draw_text_with_mask(text_layer, (en_x, current_y), line, en_font, text_color):
+                raise ValueError(f"animated_1 副标题最终渲染失败: title='{line}', font={en_font_path}")
 
     blurred_shadow = shadow_layer.filter(ImageFilter.GaussianBlur(radius=shadow_offset))
-    return Image.alpha_composite(blurred_shadow, text_layer)
+    combined_text = Image.alpha_composite(blurred_shadow, text_layer)
+    if not combined_text.getchannel("A").getbbox():
+        raise ValueError("animated_1 文字图层未产生可见像素")
+    return combined_text
 
 
 def create_style_animated_1(

@@ -225,11 +225,10 @@ def validate_font_file(font_path: Path, sample_text: Optional[str] = None, stric
 
         # 尝试加载字体文件
         from PIL import ImageFont
-        from app.plugins.mediacovergenerator.utils.text_renderer import text_to_mask
-        font = ImageFont.truetype(str(font_path), 24)
+        from app.plugins.mediacovergenerator.utils.text_renderer import font_can_render
+        ImageFont.truetype(str(font_path), 24)
         if sample_text:
-            mask, _ = text_to_mask(font, sample_text)
-            if mask is None or not mask.getbbox():
+            if not font_can_render(font_path, sample_text=sample_text, size=24):
                 message = f"字体文件示例文字渲染不可见: {font_path}, sample={sample_text}"
                 if strict_render:
                     logger.warning(message)

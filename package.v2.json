@@ -55,11 +55,12 @@
         "name": "媒体库封面生成",
         "description": "生成媒体库动态/静态封面，支持 Emby/Jellyfin",
         "labels": "媒体库,封面,Emby,Jellyfin",
-        "version": "0.9.16",
+        "version": "0.10.0",
         "icon": "mediaplay.png",
         "author": "cyt-666",
         "level": 1,
         "history": {
+            "v0.10.0": "重构封面文字渲染核心：所有静态/动态样式统一走真实像素渲染校验；字体必须实际渲染可见文字才会被使用，失败时自动切换可用字体或拒绝上传无字封面。",
             "v0.9.16": "修复 FreeType 无法渲染文字时封面无字：新增 draw_text_with_fallback 降级到 PIL ImageDraw.text 直绘，彻底解决部分环境中掩码渲染失败的问题。",
             "v0.9.15": "修复字体验证宽松导致静默生成无文字封面：将核心路径的 validate_font_file 全部改为 strict_render=True，避免可加载但渲染不可见的字体被判定为有效。",
             "v0.9.14": "修复 FreeType 字体掩码转换方式：直接包装 Pillow 的 ImagingCore，避免部分环境中手动 frombytes 转换得到空掩码而导致文字仍不可见。",

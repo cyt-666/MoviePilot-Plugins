@@ -17,6 +17,7 @@ from app.plugins.mediacovergenerator.style.style_static_2 import (
     find_dominant_vibrant_colors,
 )
 from app.plugins.mediacovergenerator.utils.color_helper import ColorHelper
+from app.plugins.mediacovergenerator.utils.text_renderer import draw_text_with_mask
 
 
 def _clamp(v, lo, hi):
@@ -122,7 +123,6 @@ def _build_text_layer(canvas_size, title, font_path, font_size, font_offset, bg_
     text_layer = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
     shadow_layer = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(text_layer)
-    sdraw = ImageDraw.Draw(shadow_layer)
 
     left_center_x = int(width * 0.25)
     left_center_y = int(height * 0.5)
@@ -171,8 +171,9 @@ def _build_text_layer(canvas_size, title, font_path, font_size, font_offset, bg_
     zh_y = y0 + int(float(zh_font_offset) * scale)
 
     for off in range(3, 11, 2):
-        sdraw.text((zh_x + off, zh_y + off), title_zh, font=zh_font, fill=shadow_color)
-    draw.text((zh_x, zh_y), title_zh, font=zh_font, fill=text_color)
+        draw_text_with_mask(shadow_layer, (zh_x + off, zh_y + off), title_zh, zh_font, shadow_color)
+    if not draw_text_with_mask(text_layer, (zh_x, zh_y), title_zh, zh_font, text_color):
+        raise ValueError(f"animated_2 主标题最终渲染失败: title='{title_zh}', font={zh_font_path}")
 
     if en_lines:
         ey = zh_y + zh_h + int(float(title_spacing) * scale)
@@ -182,11 +183,15 @@ def _build_text_layer(canvas_size, title, font_path, font_size, font_offset, bg_
             eh = eb[3] - eb[1]
             ex = left_center_x - ew // 2
             for off in range(2, 8, 2):
-                sdraw.text((ex + off, ey + off), line, font=en_font, fill=shadow_color)
-            draw.text((ex, ey), line, font=en_font, fill=text_color)
+                draw_text_with_mask(shadow_layer, (ex + off, ey + off), line, en_font, shadow_color)
+            if not draw_text_with_mask(text_layer, (ex, ey), line, en_font, text_color):
+                raise ValueError(f"animated_2 副标题最终渲染失败: title='{line}', font={en_font_path}")
             ey += eh + en_line_spacing
 
-    return Image.alpha_composite(shadow_layer.filter(ImageFilter.GaussianBlur(radius=8)), text_layer)
+    combined_text = Image.alpha_composite(shadow_layer.filter(ImageFilter.GaussianBlur(radius=8)), text_layer)
+    if not combined_text.getchannel("A").getbbox():
+        raise ValueError("animated_2 文字图层未产生可见像素")
+    return combined_text
 
 
 def create_style_animated_2(

@@ -16,6 +16,7 @@ from app.plugins.mediacovergenerator.style.style_static_2 import (
     find_dominant_vibrant_colors,
 )
 from app.plugins.mediacovergenerator.utils.color_helper import ColorHelper
+from app.plugins.mediacovergenerator.utils.text_renderer import draw_text_with_mask
 
 
 def _clamp(v, lo, hi):
@@ -107,7 +108,6 @@ def _build_text_layer(canvas_size, title, font_path, font_size, font_offset, tin
     text_layer = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
     shadow_layer = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(text_layer)
-    sdraw = ImageDraw.Draw(shadow_layer)
 
     zh_font = ImageFont.truetype(zh_font_path, int(max(1, float(zh_font_size))))
     en_font = ImageFont.truetype(en_font_path, int(max(1, float(en_font_size))))
@@ -141,21 +141,26 @@ def _build_text_layer(canvas_size, title, font_path, font_size, font_offset, tin
     zh_y = y0
 
     for off in range(3, 11, 2):
-        sdraw.text((zh_x + off, zh_y + off), title_zh, font=zh_font, fill=shadow_color)
-    draw.text((zh_x, zh_y), title_zh, font=zh_font, fill=text_color)
+        draw_text_with_mask(shadow_layer, (zh_x + off, zh_y + off), title_zh, zh_font, shadow_color)
+    if not draw_text_with_mask(text_layer, (zh_x, zh_y), title_zh, zh_font, text_color):
+        raise ValueError(f"animated_4 主标题最终渲染失败: title='{title_zh}', font={zh_font_path}")
 
     ey = zh_y + zh_h + spacing
     for line, lw, lh in line_sizes:
         ex = cx - lw // 2
         for off in range(2, 8, 2):
-            sdraw.text((ex + off, ey + off), line, font=en_font, fill=shadow_color)
-        draw.text((ex, ey), line, font=en_font, fill=text_color)
+            draw_text_with_mask(shadow_layer, (ex + off, ey + off), line, en_font, shadow_color)
+        if not draw_text_with_mask(text_layer, (ex, ey), line, en_font, text_color):
+            raise ValueError(f"animated_4 副标题最终渲染失败: title='{line}', font={en_font_path}")
         ey += lh + line_gap
 
-    return Image.alpha_composite(
+    combined_text = Image.alpha_composite(
         shadow_layer.filter(ImageFilter.GaussianBlur(radius=8)),
         text_layer,
     )
+    if not combined_text.getchannel("A").getbbox():
+        raise ValueError("animated_4 文字图层未产生可见像素")
+    return combined_text
 
 
 def create_style_animated_4(

@@ -44,6 +44,7 @@ from app.plugins.mediacovergenerator.utils.image_manager import ResolutionConfig
 from app.plugins.mediacovergenerator.utils.network_helper import NetworkHelper, validate_font_file
 from app.plugins.mediacovergenerator.utils.performance_helper import PerformanceMonitor, ProgressTracker, memory_efficient_operation
 from app.plugins.mediacovergenerator.utils.color_helper import ColorHelper
+from app.plugins.mediacovergenerator.utils.text_renderer import find_renderable_font
 
 
 class MediaCoverGenerator(_PluginBase):
@@ -54,7 +55,7 @@ class MediaCoverGenerator(_PluginBase):
     # 插件图标
     plugin_icon = "mediaplay.png"
     # 插件版本
-    plugin_version = "0.9.16"
+    plugin_version = "0.10.0"
     # 插件作者
     plugin_author = "cyt-666"
     # 作者主页
@@ -3050,7 +3051,7 @@ class MediaCoverGenerator(_PluginBase):
             if not font_path:
                 return False
             try:
-                return validate_font_file(Path(font_path), sample_text=sample_text)
+                return validate_font_file(Path(font_path), sample_text=sample_text, strict_render=True)
             except Exception:
                 return False
 
@@ -4428,14 +4429,40 @@ class MediaCoverGenerator(_PluginBase):
                     current_font_path = downloaded_font_file_path
             
             # 安全设置字体路径
-            if current_font_path and current_font_path.exists():
+            fallback_candidates = []
+            if current_font_path:
+                fallback_candidates.append(Path(current_font_path).expanduser())
+            if local_path_cfg:
+                fallback_candidates.append(Path(local_path_cfg).expanduser())
+            fallback_candidates.append(downloaded_font_file_path)
+            try:
+                for cached_font_path in Path(font_dir_path).iterdir():
+                    if cached_font_path.suffix.lower() in {".ttf", ".otf", ".ttc", ".otc", ".woff", ".woff2"}:
+                        fallback_candidates.append(cached_font_path)
+            except Exception:
+                pass
+            resolved_font_path = find_renderable_font(
+                preferred_paths=fallback_candidates,
+                sample_text=sample_text,
+                role=lang,
+            )
+
+            if resolved_font_path and resolved_font_path.exists():
+                if not current_font_path or Path(current_font_path).expanduser() != resolved_font_path:
+                    logger.warning(f"{log_prefix}{lang}字体已切换到可渲染字体: {resolved_font_path}")
+                current_font_path = resolved_font_path
                 setattr(self, final_attr, current_font_path)
-                status_log = '(本地路径)' if using_local_font else '(已下载/缓存)'
+                if using_local_font and Path(local_path_cfg).expanduser() == resolved_font_path:
+                    status_log = '(本地路径)'
+                elif resolved_font_path == downloaded_font_file_path:
+                    status_log = '(已下载/缓存)'
+                else:
+                    status_log = '(系统兜底)'
                 logger.info(f"{log_prefix}{lang}字体最终路径: {getattr(self,final_attr)} {status_log}")
             else:
                 # 字体获取失败，设置为None并记录错误
                 setattr(self, final_attr, None)
-                logger.error(f"{log_prefix}{lang}字体获取失败，这可能导致封面生成失败")
+                logger.error(f"{log_prefix}{lang}字体获取失败或无法实际渲染示例文字，这将阻止生成无字封面")
 
         # 检查是否所有必要的字体都已获取
         if not self._zh_font_path or not self._en_font_path:
@@ -4494,11 +4521,11 @@ class MediaCoverGenerator(_PluginBase):
                 self.__get_fonts()
 
             # 验证字体文件有效性
-            if self._zh_font_path and not validate_font_file(Path(self._zh_font_path), sample_text="媒体库"):
+            if self._zh_font_path and not validate_font_file(Path(self._zh_font_path), sample_text="媒体库", strict_render=True):
                 logger.warning("主标题字体文件无效，尝试重新下载")
                 return False
 
-            if self._en_font_path and not validate_font_file(Path(self._en_font_path), sample_text="MoviePilot"):
+            if self._en_font_path and not validate_font_file(Path(self._en_font_path), sample_text="MoviePilot", strict_render=True):
                 logger.warning("副标题字体文件无效，尝试重新下载")
                 return False
 
