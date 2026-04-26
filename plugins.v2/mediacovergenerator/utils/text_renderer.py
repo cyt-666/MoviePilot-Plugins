@@ -112,10 +112,223 @@ def text_to_mask(font, text: str) -> Tuple[Optional[Image.Image], Tuple[int, int
     try:
         fallback, offset = _freetype_text_to_mask(font, text)
     except Exception:
-        return None, (0, 0)
+        fallback, offset = None, (0, 0)
     if fallback is not None and fallback.getbbox():
         return fallback, offset
+
+    outline, offset = _outline_text_to_mask(font, text)
+    if outline is not None and outline.getbbox():
+        return outline, offset
     return None, (0, 0)
+
+
+def _outline_text_to_mask(font, text: str) -> Tuple[Optional[Image.Image], Tuple[int, int]]:
+    font_path = getattr(font, "path", None)
+    font_size = int(max(1, round(float(getattr(font, "size", 0) or 0))))
+    font_index = int(getattr(font, "index", 0) or 0)
+    if not font_path or not text or font_size <= 0:
+        return None, (0, 0)
+
+    try:
+        from fontTools.pens.basePen import BasePen
+        from fontTools.ttLib import TTFont
+    except Exception:
+        return None, (0, 0)
+
+    class FlattenPen(BasePen):
+        def __init__(self, glyph_set, steps: int = 12):
+            super().__init__(glyph_set)
+            self.steps = max(4, int(steps))
+            self.contours = []
+            self._contour = None
+            self._current = None
+
+        def _moveTo(self, p0):
+            self._finish_contour()
+            self._contour = [p0]
+            self._current = p0
+
+        def _lineTo(self, p1):
+            if self._contour is None:
+                self._contour = []
+            self._contour.append(p1)
+            self._current = p1
+
+        def _qCurveToOne(self, p1, p2):
+            if self._current is None:
+                self._lineTo(p2)
+                return
+            x0, y0 = self._current
+            x1, y1 = p1
+            x2, y2 = p2
+            for step in range(1, self.steps + 1):
+                t = step / self.steps
+                mt = 1.0 - t
+                x = mt * mt * x0 + 2 * mt * t * x1 + t * t * x2
+                y = mt * mt * y0 + 2 * mt * t * y1 + t * t * y2
+                self._contour.append((x, y))
+            self._current = p2
+
+        def _curveToOne(self, p1, p2, p3):
+            if self._current is None:
+                self._lineTo(p3)
+                return
+            x0, y0 = self._current
+            x1, y1 = p1
+            x2, y2 = p2
+            x3, y3 = p3
+            for step in range(1, self.steps + 1):
+                t = step / self.steps
+                mt = 1.0 - t
+                x = (
+                    mt * mt * mt * x0
+                    + 3 * mt * mt * t * x1
+                    + 3 * mt * t * t * x2
+                    + t * t * t * x3
+                )
+                y = (
+                    mt * mt * mt * y0
+                    + 3 * mt * mt * t * y1
+                    + 3 * mt * t * t * y2
+                    + t * t * t * y3
+                )
+                self._contour.append((x, y))
+            self._current = p3
+
+        def _closePath(self):
+            self._finish_contour()
+
+        def _endPath(self):
+            self._finish_contour()
+
+        def _finish_contour(self):
+            if self._contour and len(self._contour) >= 3:
+                self.contours.append(self._contour)
+            self._contour = None
+            self._current = None
+
+    def polygon_area(points):
+        area = 0.0
+        for index, (x1, y1) in enumerate(points):
+            x2, y2 = points[(index + 1) % len(points)]
+            area += x1 * y2 - x2 * y1
+        return area / 2.0
+
+    def point_in_polygon(point, polygon):
+        x, y = point
+        inside = False
+        j = len(polygon) - 1
+        for i in range(len(polygon)):
+            xi, yi = polygon[i]
+            xj, yj = polygon[j]
+            if (yi > y) != (yj > y):
+                cross_x = (xj - xi) * (y - yi) / ((yj - yi) or 1e-9) + xi
+                if x < cross_x:
+                    inside = not inside
+            j = i
+        return inside
+
+    try:
+        tt_font = TTFont(str(font_path), fontNumber=font_index, lazy=True)
+    except TypeError:
+        try:
+            tt_font = TTFont(str(font_path), lazy=True)
+        except Exception:
+            return None, (0, 0)
+    except Exception:
+        return None, (0, 0)
+
+    try:
+        glyph_set = tt_font.getGlyphSet()
+        hmtx = tt_font["hmtx"].metrics
+        units_per_em = float(tt_font["head"].unitsPerEm)
+        ascent = float(tt_font["hhea"].ascent)
+        cmap = {}
+        for table in tt_font["cmap"].tables:
+            cmap.update(table.cmap)
+
+        cursor_x = 0.0
+        contours = []
+        for char in text:
+            codepoint = ord(char)
+            glyph_name = cmap.get(codepoint)
+            if not glyph_name:
+                cursor_x += units_per_em * 0.5
+                continue
+
+            pen = FlattenPen(glyph_set)
+            glyph_set[glyph_name].draw(pen)
+            pen._finish_contour()
+            for contour in pen.contours:
+                contours.append([(x + cursor_x, y) for x, y in contour])
+
+            advance_width = hmtx.get(glyph_name, (units_per_em * 0.5, 0))[0]
+            cursor_x += float(advance_width)
+
+        if not contours:
+            return None, (0, 0)
+
+        scale = font_size / units_per_em
+        xs = [x for contour in contours for x, _ in contour]
+        ys = [y for contour in contours for _, y in contour]
+        min_x, max_x = min(xs) * scale, max(xs) * scale
+        min_y, max_y = (ascent - max(ys)) * scale, (ascent - min(ys)) * scale
+
+        pad = max(4, int(font_size * 0.08))
+        offset_x = int(min_x) - pad
+        offset_y = int(min_y) - pad
+        width = max(1, int(max_x - offset_x) + pad)
+        height = max(1, int(max_y - offset_y) + pad)
+
+        aa = 4
+        mask = Image.new("L", (width * aa, height * aa), 0)
+        draw = ImageDraw.Draw(mask)
+
+        prepared = []
+        for contour in contours:
+            points = [
+                (
+                    (x * scale - offset_x) * aa,
+                    ((ascent - y) * scale - offset_y) * aa,
+                )
+                for x, y in contour
+            ]
+            if len(points) < 3:
+                continue
+            area = abs(polygon_area(points))
+            if area <= 0:
+                continue
+            px = [p[0] for p in points]
+            py = [p[1] for p in points]
+            prepared.append((points, area, (min(px), min(py), max(px), max(py))))
+
+        prepared.sort(key=lambda item: item[1], reverse=True)
+        drawn = []
+        for points, _, bbox in prepared:
+            test_point = points[0]
+            depth = 0
+            for outer_points, _, outer_bbox in drawn:
+                if (
+                    outer_bbox[0] <= test_point[0] <= outer_bbox[2]
+                    and outer_bbox[1] <= test_point[1] <= outer_bbox[3]
+                    and point_in_polygon(test_point, outer_points)
+                ):
+                    depth += 1
+            draw.polygon(points, fill=255 if depth % 2 == 0 else 0)
+            drawn.append((points, _, bbox))
+
+        if aa > 1:
+            mask = mask.resize((width, height), Image.Resampling.LANCZOS)
+        if not mask.getbbox():
+            return None, (0, 0)
+        return mask, (offset_x, offset_y)
+    except Exception:
+        return None, (0, 0)
+    finally:
+        try:
+            tt_font.close()
+        except Exception:
+            pass
 
 
 def _composite_mask(target: Image.Image, xy: Tuple[int, int], mask: Image.Image, fill: Sequence[int]) -> bool:
