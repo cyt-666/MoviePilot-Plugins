@@ -3,11 +3,12 @@
         "name": "MoviePilot MCP Server",
         "description": "MoviePilot v2.10.4 的 ChatGPT 外部 MCP OAuth 包装层",
         "labels": "MCP,ChatGPT,OpenAI,自动化,MoviePilot",
-        "version": "0.4.1",
+        "version": "0.4.2",
         "icon": "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/moviepilotmcp.svg",
         "author": "cyt-666",
         "level": 1,
         "history": {
+            "v0.4.2": "加长 MCP 内部转发超时时间：默认从 120 秒提升到 600 秒，并新增配置项支持按需调整，避免搜索种子等耗时工具尚未执行完成就被代理请求切断。",
             "v0.4.1": "版本号更新，因为我高兴。",
             "v0.4.0": "架构重构：将 MCP 工具调度层从自定义 AgentToolBinding 映射引擎改为直接透传至 MoviePilot v2.10.4 内置 /api/v1/mcp，插件专注于 OAuth 2.0 AS 角色；工具覆盖率从约 30 个提升至内置 MCP 全量工具；写操作开关通过前端拦截和 tools/list 过滤实现。",
             "v0.3.10": "修复 ChatGPT 提示「并非所有请求的权限都已授予」的警告：在 token 响应中原样回显客户端请求的 scope 字符串（含未知 scope，如 openid），服务端内部权限校验仍基于用户启用的 scope。",

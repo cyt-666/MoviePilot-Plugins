@@ -41,7 +41,7 @@ class MoviePilotMCP(_PluginBase):
     plugin_name = "MoviePilot MCP Server"
     plugin_desc = "MoviePilot v2.10.4 的 ChatGPT 外部 MCP OAuth 包装层"
     plugin_icon = "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/moviepilotmcp.svg"
-    plugin_version = "0.4.1"
+    plugin_version = "0.4.2"
     plugin_author = "cyt-666"
     author_url = "https://github.com/cyt-666/MoviePilot-Plugins"
     plugin_config_prefix = "moviepilotmcp_"
@@ -81,6 +81,7 @@ class MoviePilotMCP(_PluginBase):
         self._mcp_token = ""
         self._actor_name = "ChatGPT MCP"
         self._enable_write_tools = True
+        self._mcp_proxy_timeout = 600
 
     def init_plugin(self, config: dict = None):
         config = config or {}
@@ -89,6 +90,7 @@ class MoviePilotMCP(_PluginBase):
         self._allow_legacy_token = bool(config.get("allow_legacy_token", False))
         self._mcp_token = (config.get("mcp_token") or "").strip()
         self._actor_name = (config.get("actor_name") or "ChatGPT MCP").strip() or "ChatGPT MCP"
+        self._mcp_proxy_timeout = self._parse_proxy_timeout(config.get("mcp_proxy_timeout", 600))
 
         if not self._mcp_token:
             self._mcp_token = self._generate_token()
@@ -100,6 +102,7 @@ class MoviePilotMCP(_PluginBase):
                 "allow_legacy_token": self._allow_legacy_token,
                 "actor_name": self._actor_name,
                 "enable_write_tools": self._enable_write_tools,
+                "mcp_proxy_timeout": self._mcp_proxy_timeout,
             }
         )
 
@@ -108,6 +111,14 @@ class MoviePilotMCP(_PluginBase):
 
     def stop_service(self):
         pass
+
+    @staticmethod
+    def _parse_proxy_timeout(value: Any) -> int:
+        try:
+            timeout = int(float(value))
+        except (TypeError, ValueError):
+            timeout = 600
+        return max(30, min(timeout, 3600))
 
     def get_api(self) -> List[Dict[str, Any]]:
         return [
@@ -226,6 +237,25 @@ class MoviePilotMCP(_PluginBase):
                                         "props": {
                                             "model": "enabled",
                                             "label": "启用外部 MCP 包装层",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "mcp_proxy_timeout",
+                                            "label": "内部 MCP 转发超时（秒）",
+                                            "placeholder": "600",
+                                            "type": "number",
+                                            "min": 30,
+                                            "max": 3600,
+                                            "hint": "用于等待 MoviePilot 内置工具执行完成；搜索种子等慢工具建议保持 600 秒或更高。",
+                                            "persistentHint": True,
                                         },
                                     }
                                 ],
@@ -402,6 +432,7 @@ class MoviePilotMCP(_PluginBase):
             "allow_legacy_token": False,
             "actor_name": "ChatGPT MCP",
             "enable_write_tools": True,
+            "mcp_proxy_timeout": 600,
             "endpoint_url": endpoint_url,
             "authorize_url": authorize_url,
             "token_url": token_url,
@@ -426,6 +457,7 @@ class MoviePilotMCP(_PluginBase):
                     {"component": "VCardText", "text": f"OAuth Token：{token_url}"},
                     {"component": "VCardText", "text": f"写操作工具：{'已开启' if self._enable_write_tools else '已关闭'}"},
                     {"component": "VCardText", "text": f"写入显示名称：{self._actor_name}"},
+                    {"component": "VCardText", "text": f"内部 MCP 转发超时：{self._mcp_proxy_timeout} 秒"},
                     {"component": "VCardText", "text": f"兼容静态 Token：{'已开启' if self._allow_legacy_token else '已关闭'}"},
                 ],
             }
@@ -480,8 +512,25 @@ class MoviePilotMCP(_PluginBase):
             fwd_headers["X-API-KEY"] = settings.API_TOKEN
 
         try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
+            async with httpx.AsyncClient(timeout=float(self._mcp_proxy_timeout)) as client:
                 resp = await client.post(internal_url, content=body_bytes, headers=fwd_headers)
+        except httpx.TimeoutException as err:
+            logger.error(
+                f"MoviePilot MCP 内部转发超时：已等待 {self._mcp_proxy_timeout} 秒，"
+                f"可在插件配置中继续调大内部 MCP 转发超时。错误：{err}",
+                exc_info=True,
+            )
+            return JSONResponse(
+                {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {
+                        "code": -32603,
+                        "message": f"Internal proxy timeout after {self._mcp_proxy_timeout}s",
+                    },
+                },
+                status_code=504,
+            )
         except Exception as err:
             logger.error(f"MoviePilot MCP 内部转发失败：{err}", exc_info=True)
             return JSONResponse(
