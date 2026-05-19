@@ -1,5 +1,4 @@
-pillow==11.2.1
-numpy==2.2.0
-pytz==2025.2
-pyyaml==6.0.2
+# Pillow, pytz and PyYAML are provided by MoviePilot itself. Do not pin them here,
+# otherwise fresh MoviePilot installs may reject the plugin for protected runtime conflicts.
+numpy>=1.26,<3.0
 fonttools>=4.0.0

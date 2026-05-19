@@ -55,7 +55,7 @@ class MediaCoverGenerator(_PluginBase):
     # 插件图标
     plugin_icon = "mediaplay.png"
     # 插件版本
-    plugin_version = "0.10.1"
+    plugin_version = "0.10.2"
     # 插件作者
     plugin_author = "cyt-666"
     # 作者主页
