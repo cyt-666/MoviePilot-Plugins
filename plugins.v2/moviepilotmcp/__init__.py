@@ -41,7 +41,7 @@ class MoviePilotMCP(_PluginBase):
     plugin_name = "MoviePilot MCP Server"
     plugin_desc = "MoviePilot 内置 Agent 工具的 MCP/OpenAPI 双协议对外暴露层，支持 OAuth 2.0 + PKCE 鉴权"
     plugin_icon = "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/moviepilotmcp.svg"
-    plugin_version = "0.5.0"
+    plugin_version = "0.5.1"
     plugin_author = "cyt-666"
     author_url = "https://github.com/cyt-666/MoviePilot-Plugins"
     plugin_config_prefix = "moviepilotmcp_"
@@ -755,10 +755,9 @@ class MoviePilotMCP(_PluginBase):
         return JSONResponse({"success": True, "result": text})
 
     async def handle_openapi_spec(self, request: Request):
-        """动态生成 OpenAPI 3.0.3 规范文档。"""
+        """动态生成 OpenAPI 3.0.3 规范文档（无需认证，供 GPT Actions / Swagger UI 等发现使用）。"""
         if not self._enabled:
             raise HTTPException(status_code=403, detail="MoviePilot MCP 包装层未启用")
-        self._authorize_mcp_request(request)
 
         tools, error = await self._fetch_mcp_tools()
         if error:
