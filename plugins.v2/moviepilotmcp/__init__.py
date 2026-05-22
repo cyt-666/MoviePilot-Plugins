@@ -41,7 +41,7 @@ class MoviePilotMCP(_PluginBase):
     plugin_name = "MoviePilot MCP Server"
     plugin_desc = "MoviePilot 内置 Agent 工具的 MCP/OpenAPI 双协议对外暴露层，支持 OAuth 2.0 + PKCE 鉴权"
     plugin_icon = "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/moviepilotmcp.svg"
-    plugin_version = "0.7.0"
+    plugin_version = "0.7.1"
     plugin_author = "cyt-666"
     author_url = "https://github.com/cyt-666/MoviePilot-Plugins"
     plugin_config_prefix = "moviepilotmcp_"
@@ -200,39 +200,39 @@ class MoviePilotMCP(_PluginBase):
                 "description": "供 VS Code / ChatGPT 等 OAuth 客户端自动注册 public client",
                 "allow_anonymous": True,
             },
-            # OpenAPI REST 端点
-            {
-                "path": "/openapi/tools",
-                "endpoint": self.handle_openapi_list_tools,
-                "methods": ["GET"],
-                "summary": "列出所有可用工具（OpenAPI REST）",
-                "description": "以 REST 格式返回所有可用 MCP 工具列表",
-                "allow_anonymous": True,
-            },
-            {
-                "path": "/openapi/tools/{tool_name}",
-                "endpoint": self.handle_openapi_call_tool,
-                "methods": ["POST"],
-                "summary": "调用指定工具（OpenAPI REST）",
-                "description": "通过 REST 接口调用 MCP 工具，请求体为工具参数 JSON",
-                "allow_anonymous": True,
-            },
-            {
-                "path": "/openapi.json",
-                "endpoint": self.handle_openapi_spec,
-                "methods": ["GET"],
-                "summary": "OpenAPI 3.0 Spec（只读工具）",
-                "description": "动态生成的 OpenAPI 3.0 规范文档，仅包含只读工具，适合 ChatGPT Actions 等受限场景",
-                "allow_anonymous": True,
-            },
-            {
-                "path": "/openapi.write.json",
-                "endpoint": self.handle_openapi_write_spec,
-                "methods": ["GET"],
-                "summary": "OpenAPI 3.0 Spec（写操作工具）",
-                "description": "动态生成的 OpenAPI 3.0 规范文档，仅包含写操作工具",
-                "allow_anonymous": True,
-            },
+            # OpenAPI REST 端点（暂不对外暴露，代码保留供后续启用）
+            # {
+            #     "path": "/openapi/tools",
+            #     "endpoint": self.handle_openapi_list_tools,
+            #     "methods": ["GET"],
+            #     "summary": "列出所有可用工具（OpenAPI REST）",
+            #     "description": "以 REST 格式返回所有可用 MCP 工具列表",
+            #     "allow_anonymous": True,
+            # },
+            # {
+            #     "path": "/openapi/tools/{tool_name}",
+            #     "endpoint": self.handle_openapi_call_tool,
+            #     "methods": ["POST"],
+            #     "summary": "调用指定工具（OpenAPI REST）",
+            #     "description": "通过 REST 接口调用 MCP 工具，请求体为工具参数 JSON",
+            #     "allow_anonymous": True,
+            # },
+            # {
+            #     "path": "/openapi.json",
+            #     "endpoint": self.handle_openapi_spec,
+            #     "methods": ["GET"],
+            #     "summary": "OpenAPI 3.0 Spec（只读工具）",
+            #     "description": "动态生成的 OpenAPI 3.0 规范文档，仅包含只读工具，适合 ChatGPT Actions 等受限场景",
+            #     "allow_anonymous": True,
+            # },
+            # {
+            #     "path": "/openapi.write.json",
+            #     "endpoint": self.handle_openapi_write_spec,
+            #     "methods": ["GET"],
+            #     "summary": "OpenAPI 3.0 Spec（写操作工具）",
+            #     "description": "动态生成的 OpenAPI 3.0 规范文档，仅包含写操作工具",
+            #     "allow_anonymous": True,
+            # },
         ]
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
@@ -240,8 +240,8 @@ class MoviePilotMCP(_PluginBase):
         authorize_url = self._build_authorization_url()
         token_url = self._build_token_url()
         metadata_url = self._build_resource_metadata_url()
-        openapi_spec_url = self._build_openapi_spec_url()
-        openapi_write_spec_url = self._build_openapi_write_spec_url()
+        # openapi_spec_url = self._build_openapi_spec_url()
+        # openapi_write_spec_url = self._build_openapi_write_spec_url()
         return [
             {
                 "component": "VForm",
@@ -457,36 +457,37 @@ class MoviePilotMCP(_PluginBase):
                                     }
                                 ],
                             },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "openapi_spec_url",
-                                            "label": "OpenAPI Spec URL（只读工具，推荐用于 ChatGPT Actions）",
-                                            "readonly": True,
-                                            "variant": "outlined",
-                                        },
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12},
-                                "content": [
-                                    {
-                                        "component": "VTextField",
-                                        "props": {
-                                            "model": "openapi_write_spec_url",
-                                            "label": "OpenAPI Write Spec URL（写操作工具）",
-                                            "readonly": True,
-                                            "variant": "outlined",
-                                        },
-                                    }
-                                ],
-                            },
+                            # OpenAPI URL 字段暂不展示
+                            # {
+                            #     "component": "VCol",
+                            #     "props": {"cols": 12},
+                            #     "content": [
+                            #         {
+                            #             "component": "VTextField",
+                            #             "props": {
+                            #                 "model": "openapi_spec_url",
+                            #                 "label": "OpenAPI Spec URL（只读工具，推荐用于 ChatGPT Actions）",
+                            #                 "readonly": True,
+                            #                 "variant": "outlined",
+                            #             },
+                            #         }
+                            #     ],
+                            # },
+                            # {
+                            #     "component": "VCol",
+                            #     "props": {"cols": 12},
+                            #     "content": [
+                            #         {
+                            #             "component": "VTextField",
+                            #             "props": {
+                            #                 "model": "openapi_write_spec_url",
+                            #                 "label": "OpenAPI Write Spec URL（写操作工具）",
+                            #                 "readonly": True,
+                            #                 "variant": "outlined",
+                            #             },
+                            #         }
+                            #     ],
+                            # },
                         ],
                     }
                 ],
@@ -502,8 +503,8 @@ class MoviePilotMCP(_PluginBase):
             "authorize_url": authorize_url,
             "token_url": token_url,
             "resource_metadata_url": metadata_url,
-            "openapi_spec_url": openapi_spec_url,
-            "openapi_write_spec_url": openapi_write_spec_url,
+            # "openapi_spec_url": openapi_spec_url,
+            # "openapi_write_spec_url": openapi_write_spec_url,
             "oauth_scope": self._format_scope(self._default_scopes()),
             "show_mcp_token": False,
         }
@@ -512,8 +513,8 @@ class MoviePilotMCP(_PluginBase):
         endpoint_url = self._build_endpoint_url()
         authorize_url = self._build_authorization_url()
         token_url = self._build_token_url()
-        openapi_spec_url = self._build_openapi_spec_url()
-        openapi_write_spec_url = self._build_openapi_write_spec_url()
+        # openapi_spec_url = self._build_openapi_spec_url()
+        # openapi_write_spec_url = self._build_openapi_write_spec_url()
         return [
             {
                 "component": "VCard",
@@ -524,8 +525,8 @@ class MoviePilotMCP(_PluginBase):
                     {"component": "VCardText", "text": f"MCP Endpoint：{endpoint_url}"},
                     {"component": "VCardText", "text": f"OAuth Authorization：{authorize_url}"},
                     {"component": "VCardText", "text": f"OAuth Token：{token_url}"},
-                    {"component": "VCardText", "text": f"OpenAPI Spec（只读）：{openapi_spec_url}"},
-                    {"component": "VCardText", "text": f"OpenAPI Spec（写操作）：{openapi_write_spec_url}"},
+                    # {"component": "VCardText", "text": f"OpenAPI Spec（只读）：{openapi_spec_url}"},
+                    # {"component": "VCardText", "text": f"OpenAPI Spec（写操作）：{openapi_write_spec_url}"},
                     {"component": "VCardText", "text": f"写操作工具：{'已开启' if self._enable_write_tools else '已关闭'}"},
                     {"component": "VCardText", "text": f"写入显示名称：{self._actor_name}"},
                     {"component": "VCardText", "text": f"内部 MCP 转发超时：{self._mcp_proxy_timeout} 秒"},
