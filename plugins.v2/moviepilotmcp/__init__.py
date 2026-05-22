@@ -39,9 +39,9 @@ class MoviePilotMCP(_PluginBase):
     """
 
     plugin_name = "MoviePilot MCP Server"
-    plugin_desc = "MoviePilot v2.10.4 的 ChatGPT 外部 MCP OAuth 包装层"
+    plugin_desc = "MoviePilot 内置 Agent 工具的 MCP/OpenAPI 双协议对外暴露层，支持 OAuth 2.0 + PKCE 鉴权"
     plugin_icon = "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/moviepilotmcp.svg"
-    plugin_version = "0.4.2"
+    plugin_version = "0.5.0"
     plugin_author = "cyt-666"
     author_url = "https://github.com/cyt-666/MoviePilot-Plugins"
     plugin_config_prefix = "moviepilotmcp_"
@@ -200,6 +200,31 @@ class MoviePilotMCP(_PluginBase):
                 "description": "供 VS Code / ChatGPT 等 OAuth 客户端自动注册 public client",
                 "allow_anonymous": True,
             },
+            # OpenAPI REST 端点
+            {
+                "path": "/openapi/tools",
+                "endpoint": self.handle_openapi_list_tools,
+                "methods": ["GET"],
+                "summary": "列出所有可用工具（OpenAPI REST）",
+                "description": "以 REST 格式返回所有可用 MCP 工具列表",
+                "allow_anonymous": True,
+            },
+            {
+                "path": "/openapi/tools/{tool_name}",
+                "endpoint": self.handle_openapi_call_tool,
+                "methods": ["POST"],
+                "summary": "调用指定工具（OpenAPI REST）",
+                "description": "通过 REST 接口调用 MCP 工具，请求体为工具参数 JSON",
+                "allow_anonymous": True,
+            },
+            {
+                "path": "/openapi.json",
+                "endpoint": self.handle_openapi_spec,
+                "methods": ["GET"],
+                "summary": "OpenAPI 3.0 Spec",
+                "description": "动态生成的 OpenAPI 3.0 规范文档，描述所有可用工具",
+                "allow_anonymous": True,
+            },
         ]
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
@@ -207,6 +232,7 @@ class MoviePilotMCP(_PluginBase):
         authorize_url = self._build_authorization_url()
         token_url = self._build_token_url()
         metadata_url = self._build_resource_metadata_url()
+        openapi_spec_url = self._build_openapi_spec_url()
         return [
             {
                 "component": "VForm",
@@ -223,7 +249,7 @@ class MoviePilotMCP(_PluginBase):
                                         "props": {
                                             "type": "info",
                                             "variant": "tonal",
-                                            "text": "该插件是 MoviePilot 内置 Agent 工具的 ChatGPT 外部 MCP OAuth 包装层：对外暴露独立 MCP 入口，对内优先复用内置 Agent tools，并通过 OAuth 2.0 Authorization Code + PKCE 完成授权。",
+                                            "text": "该插件将 MoviePilot 内置 Agent 工具通过 MCP 和 OpenAPI 双协议对外暴露：对内复用内置 Agent tools，对外提供 MCP JSON-RPC 和 REST/OpenAPI 两种接入方式，并通过 OAuth 2.0 Authorization Code + PKCE 完成授权。",
                                         },
                                     }
                                 ],
@@ -422,6 +448,21 @@ class MoviePilotMCP(_PluginBase):
                                     }
                                 ],
                             },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "openapi_spec_url",
+                                            "label": "OpenAPI Spec URL（可用于 ChatGPT Actions / Swagger UI）",
+                                            "readonly": True,
+                                            "variant": "outlined",
+                                        },
+                                    }
+                                ],
+                            },
                         ],
                     }
                 ],
@@ -437,6 +478,7 @@ class MoviePilotMCP(_PluginBase):
             "authorize_url": authorize_url,
             "token_url": token_url,
             "resource_metadata_url": metadata_url,
+            "openapi_spec_url": openapi_spec_url,
             "oauth_scope": self._format_scope(self._default_scopes()),
             "show_mcp_token": False,
         }
@@ -445,16 +487,18 @@ class MoviePilotMCP(_PluginBase):
         endpoint_url = self._build_endpoint_url()
         authorize_url = self._build_authorization_url()
         token_url = self._build_token_url()
+        openapi_spec_url = self._build_openapi_spec_url()
         return [
             {
                 "component": "VCard",
                 "props": {"variant": "tonal"},
                 "content": [
-                    {"component": "VCardTitle", "text": "MoviePilot ChatGPT MCP 包装层"},
+                    {"component": "VCardTitle", "text": "MoviePilot MCP / OpenAPI 包装层"},
                     {"component": "VCardText", "text": f"状态：{'已启用' if self._enabled else '未启用'}"},
-                    {"component": "VCardText", "text": f"Endpoint：{endpoint_url}"},
+                    {"component": "VCardText", "text": f"MCP Endpoint：{endpoint_url}"},
                     {"component": "VCardText", "text": f"OAuth Authorization：{authorize_url}"},
                     {"component": "VCardText", "text": f"OAuth Token：{token_url}"},
+                    {"component": "VCardText", "text": f"OpenAPI Spec：{openapi_spec_url}"},
                     {"component": "VCardText", "text": f"写操作工具：{'已开启' if self._enable_write_tools else '已关闭'}"},
                     {"component": "VCardText", "text": f"写入显示名称：{self._actor_name}"},
                     {"component": "VCardText", "text": f"内部 MCP 转发超时：{self._mcp_proxy_timeout} 秒"},
@@ -567,6 +611,236 @@ class MoviePilotMCP(_PluginBase):
             return resp_data
         result["tools"] = [t for t in tools if t.get("name") not in self._write_tool_names]
         return resp_data
+
+    # ==================== OpenAPI REST 端点 ====================
+
+    async def _forward_to_internal_mcp(
+        self, body_bytes: bytes, timeout: Optional[float] = None
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """
+        将 JSON-RPC 请求转发至内置 MCP 端点，返回 (响应JSON, 错误信息)。
+        成功时 error 为 None；失败时 result 为 None。
+        """
+        internal_url = f"http://127.0.0.1:{settings.PORT}{settings.API_V1_STR}/mcp"
+        fwd_headers = {"Content-Type": "application/json"}
+        if settings.API_TOKEN:
+            fwd_headers["X-API-KEY"] = settings.API_TOKEN
+
+        try:
+            async with httpx.AsyncClient(timeout=timeout or float(self._mcp_proxy_timeout)) as client:
+                resp = await client.post(internal_url, content=body_bytes, headers=fwd_headers)
+        except httpx.TimeoutException:
+            return None, f"内部 MCP 转发超时（{timeout or self._mcp_proxy_timeout} 秒）"
+        except Exception as err:
+            return None, f"内部 MCP 转发失败：{err}"
+
+        if resp.status_code == 204:
+            return None, "内部 MCP 返回空响应"
+
+        try:
+            return resp.json(), None
+        except Exception:
+            return None, f"内部 MCP 响应解析失败：status={resp.status_code}"
+
+    async def _fetch_mcp_tools(self) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        """
+        通过内部 MCP tools/list 获取可用工具列表，已过滤写工具和隐藏工具。
+        返回 (工具列表, 错误信息)。
+        """
+        payload = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
+        resp_data, error = await self._forward_to_internal_mcp(payload.encode("utf-8"))
+        if error:
+            return [], error
+        if not isinstance(resp_data, dict):
+            return [], "内部 MCP 响应格式错误"
+        result = resp_data.get("result")
+        if not isinstance(result, dict):
+            return [], "内部 MCP 响应缺少 result"
+        tools = result.get("tools")
+        if not isinstance(tools, list):
+            return [], "内部 MCP 响应缺少 tools"
+        # 过滤写工具
+        if not self._enable_write_tools:
+            tools = [t for t in tools if t.get("name") not in self._write_tool_names]
+        return tools, None
+
+    @staticmethod
+    def _strip_explanation_from_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        从 inputSchema 中移除 explanation 字段及其 required 引用，
+        使 OpenAPI spec 对 REST 客户端更友好。
+        """
+        if not isinstance(schema, dict):
+            return schema
+        schema = dict(schema)
+        props = dict(schema.get("properties") or {})
+        props.pop("explanation", None)
+        schema["properties"] = props
+        required = [r for r in (schema.get("required") or []) if r != "explanation"]
+        if required:
+            schema["required"] = required
+        else:
+            schema.pop("required", None)
+        return schema
+
+    async def handle_openapi_list_tools(self, request: Request):
+        """以 REST 格式返回所有可用工具列表。"""
+        if not self._enabled:
+            raise HTTPException(status_code=403, detail="MoviePilot MCP 包装层未启用")
+        self._authorize_mcp_request(request)
+
+        tools, error = await self._fetch_mcp_tools()
+        if error:
+            raise HTTPException(status_code=502, detail=error)
+
+        return JSONResponse([
+            {
+                "name": t.get("name"),
+                "description": t.get("description"),
+                "inputSchema": self._strip_explanation_from_schema(t.get("inputSchema") or {}),
+            }
+            for t in tools
+        ])
+
+    async def handle_openapi_call_tool(self, request: Request, tool_name: str):
+        """通过 REST 接口调用指定 MCP 工具。"""
+        if not self._enabled:
+            raise HTTPException(status_code=403, detail="MoviePilot MCP 包装层未启用")
+        self._authorize_mcp_request(request)
+
+        # 写工具拦截
+        if not self._enable_write_tools and tool_name in self._write_tool_names:
+            return JSONResponse(
+                {"success": False, "error": f"写操作工具 '{tool_name}' 已被禁用"},
+                status_code=403,
+            )
+
+        # 读取请求体并注入 explanation
+        try:
+            arguments = await request.json()
+        except Exception:
+            arguments = {}
+        if not isinstance(arguments, dict):
+            arguments = {}
+        arguments.setdefault("explanation", "OpenAPI call")
+
+        # 构造 JSON-RPC 请求转发至内置 MCP
+        rpc_payload = json.dumps({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": tool_name, "arguments": arguments},
+        })
+        resp_data, error = await self._forward_to_internal_mcp(rpc_payload.encode("utf-8"))
+        if error:
+            return JSONResponse({"success": False, "error": error}, status_code=502)
+
+        # 解析 MCP 响应
+        result = (resp_data or {}).get("result")
+        if not isinstance(result, dict):
+            err = (resp_data or {}).get("error")
+            return JSONResponse(
+                {"success": False, "error": err.get("message", "未知错误") if isinstance(err, dict) else str(err)},
+                status_code=500,
+            )
+
+        content = result.get("content")
+        is_error = result.get("isError", False)
+        text = ""
+        if isinstance(content, list) and content:
+            text = content[0].get("text", "") if isinstance(content[0], dict) else str(content[0])
+
+        if is_error:
+            return JSONResponse({"success": False, "error": text}, status_code=400)
+        return JSONResponse({"success": True, "result": text})
+
+    async def handle_openapi_spec(self, request: Request):
+        """动态生成 OpenAPI 3.0.3 规范文档。"""
+        if not self._enabled:
+            raise HTTPException(status_code=403, detail="MoviePilot MCP 包装层未启用")
+        self._authorize_mcp_request(request)
+
+        tools, error = await self._fetch_mcp_tools()
+        if error:
+            raise HTTPException(status_code=502, detail=error)
+
+        base_url = str(request.base_url).rstrip("/")
+        plugin_prefix = f"{settings.API_V1_STR}/plugin/{self.__class__.__name__}"
+
+        paths = {}
+        for tool in tools:
+            tool_name = tool.get("name", "")
+            input_schema = self._strip_explanation_from_schema(tool.get("inputSchema") or {})
+            path_key = f"{plugin_prefix}/openapi/tools/{tool_name}"
+            paths[path_key] = {
+                "post": {
+                    "operationId": tool_name,
+                    "summary": tool.get("description", tool_name),
+                    "requestBody": {
+                        "required": True,
+                        "content": {
+                            "application/json": {
+                                "schema": input_schema,
+                            }
+                        },
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "工具调用成功",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "success": {"type": "boolean"},
+                                            "result": {"type": "string"},
+                                        },
+                                        "required": ["success", "result"],
+                                    }
+                                }
+                            },
+                        },
+                        "400": {
+                            "description": "工具调用失败或返回错误",
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "success": {"type": "boolean", "enum": [False]},
+                                            "error": {"type": "string"},
+                                        },
+                                        "required": ["success", "error"],
+                                    }
+                                }
+                            },
+                        },
+                    },
+                    "security": [{"BearerAuth": []}],
+                }
+            }
+
+        spec = {
+            "openapi": "3.0.3",
+            "info": {
+                "title": "MoviePilot MCP OpenAPI",
+                "description": "MoviePilot 内置 Agent 工具的 REST 接口，由 MoviePilotMCP 插件动态生成。",
+                "version": self.plugin_version,
+            },
+            "servers": [{"url": base_url}],
+            "paths": paths,
+            "components": {
+                "securitySchemes": {
+                    "BearerAuth": {
+                        "type": "http",
+                        "scheme": "bearer",
+                        "description": "OAuth 2.0 Bearer Token，通过 /oauth/token 端点获取",
+                    }
+                }
+            },
+        }
+
+        return JSONResponse(spec)
 
     async def handle_protected_resource_metadata(self, _: Request):
         if not self._enabled:
@@ -1445,6 +1719,9 @@ class MoviePilotMCP(_PluginBase):
         return self._absolute_url(
             self._plugin_api_path("/.well-known/oauth-protected-resource")
         )
+
+    def _build_openapi_spec_url(self) -> str:
+        return self._absolute_url(self._plugin_api_path("/openapi.json"))
 
     def _plugin_api_path(self, suffix: str = "") -> str:
         return f"{settings.API_V1_STR}/plugin/{self.__class__.__name__}{suffix}"
