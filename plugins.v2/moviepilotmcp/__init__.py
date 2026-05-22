@@ -41,7 +41,7 @@ class MoviePilotMCP(_PluginBase):
     plugin_name = "MoviePilot MCP Server"
     plugin_desc = "MoviePilot 内置 Agent 工具的 MCP/OpenAPI 双协议对外暴露层，支持 OAuth 2.0 + PKCE 鉴权"
     plugin_icon = "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/moviepilotmcp.svg"
-    plugin_version = "0.5.1"
+    plugin_version = "0.7.0"
     plugin_author = "cyt-666"
     author_url = "https://github.com/cyt-666/MoviePilot-Plugins"
     plugin_config_prefix = "moviepilotmcp_"
@@ -221,8 +221,16 @@ class MoviePilotMCP(_PluginBase):
                 "path": "/openapi.json",
                 "endpoint": self.handle_openapi_spec,
                 "methods": ["GET"],
-                "summary": "OpenAPI 3.0 Spec",
-                "description": "动态生成的 OpenAPI 3.0 规范文档，描述所有可用工具",
+                "summary": "OpenAPI 3.0 Spec（只读工具）",
+                "description": "动态生成的 OpenAPI 3.0 规范文档，仅包含只读工具，适合 ChatGPT Actions 等受限场景",
+                "allow_anonymous": True,
+            },
+            {
+                "path": "/openapi.write.json",
+                "endpoint": self.handle_openapi_write_spec,
+                "methods": ["GET"],
+                "summary": "OpenAPI 3.0 Spec（写操作工具）",
+                "description": "动态生成的 OpenAPI 3.0 规范文档，仅包含写操作工具",
                 "allow_anonymous": True,
             },
         ]
@@ -233,6 +241,7 @@ class MoviePilotMCP(_PluginBase):
         token_url = self._build_token_url()
         metadata_url = self._build_resource_metadata_url()
         openapi_spec_url = self._build_openapi_spec_url()
+        openapi_write_spec_url = self._build_openapi_write_spec_url()
         return [
             {
                 "component": "VForm",
@@ -456,7 +465,22 @@ class MoviePilotMCP(_PluginBase):
                                         "component": "VTextField",
                                         "props": {
                                             "model": "openapi_spec_url",
-                                            "label": "OpenAPI Spec URL（可用于 ChatGPT Actions / Swagger UI）",
+                                            "label": "OpenAPI Spec URL（只读工具，推荐用于 ChatGPT Actions）",
+                                            "readonly": True,
+                                            "variant": "outlined",
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "openapi_write_spec_url",
+                                            "label": "OpenAPI Write Spec URL（写操作工具）",
                                             "readonly": True,
                                             "variant": "outlined",
                                         },
@@ -479,6 +503,7 @@ class MoviePilotMCP(_PluginBase):
             "token_url": token_url,
             "resource_metadata_url": metadata_url,
             "openapi_spec_url": openapi_spec_url,
+            "openapi_write_spec_url": openapi_write_spec_url,
             "oauth_scope": self._format_scope(self._default_scopes()),
             "show_mcp_token": False,
         }
@@ -488,6 +513,7 @@ class MoviePilotMCP(_PluginBase):
         authorize_url = self._build_authorization_url()
         token_url = self._build_token_url()
         openapi_spec_url = self._build_openapi_spec_url()
+        openapi_write_spec_url = self._build_openapi_write_spec_url()
         return [
             {
                 "component": "VCard",
@@ -498,7 +524,8 @@ class MoviePilotMCP(_PluginBase):
                     {"component": "VCardText", "text": f"MCP Endpoint：{endpoint_url}"},
                     {"component": "VCardText", "text": f"OAuth Authorization：{authorize_url}"},
                     {"component": "VCardText", "text": f"OAuth Token：{token_url}"},
-                    {"component": "VCardText", "text": f"OpenAPI Spec：{openapi_spec_url}"},
+                    {"component": "VCardText", "text": f"OpenAPI Spec（只读）：{openapi_spec_url}"},
+                    {"component": "VCardText", "text": f"OpenAPI Spec（写操作）：{openapi_write_spec_url}"},
                     {"component": "VCardText", "text": f"写操作工具：{'已开启' if self._enable_write_tools else '已关闭'}"},
                     {"component": "VCardText", "text": f"写入显示名称：{self._actor_name}"},
                     {"component": "VCardText", "text": f"内部 MCP 转发超时：{self._mcp_proxy_timeout} 秒"},
@@ -754,18 +781,8 @@ class MoviePilotMCP(_PluginBase):
             return JSONResponse({"success": False, "error": text}, status_code=400)
         return JSONResponse({"success": True, "result": text})
 
-    async def handle_openapi_spec(self, request: Request):
-        """动态生成 OpenAPI 3.0.3 规范文档（无需认证，供 GPT Actions / Swagger UI 等发现使用）。"""
-        if not self._enabled:
-            raise HTTPException(status_code=403, detail="MoviePilot MCP 包装层未启用")
-
-        tools, error = await self._fetch_mcp_tools()
-        if error:
-            raise HTTPException(status_code=502, detail=error)
-
-        base_url = str(request.base_url).rstrip("/")
-        plugin_prefix = f"{settings.API_V1_STR}/plugin/{self.__class__.__name__}"
-
+    def _build_openapi_paths(self, tools: List[Dict[str, Any]], plugin_prefix: str) -> Dict[str, Any]:
+        """将工具列表转换为 OpenAPI paths 字段。"""
         paths = {}
         for tool in tools:
             tool_name = tool.get("name", "")
@@ -818,12 +835,23 @@ class MoviePilotMCP(_PluginBase):
                     "security": [{"BearerAuth": []}],
                 }
             }
+        return paths
 
-        spec = {
+    def _build_openapi_spec(
+        self,
+        tools: List[Dict[str, Any]],
+        base_url: str,
+        title_suffix: str = "",
+        description_suffix: str = "",
+    ) -> Dict[str, Any]:
+        """组装完整的 OpenAPI 3.0.3 规范文档。"""
+        plugin_prefix = f"{settings.API_V1_STR}/plugin/{self.__class__.__name__}"
+        paths = self._build_openapi_paths(tools, plugin_prefix)
+        return {
             "openapi": "3.0.3",
             "info": {
-                "title": "MoviePilot MCP OpenAPI",
-                "description": "MoviePilot 内置 Agent 工具的 REST 接口，由 MoviePilotMCP 插件动态生成。",
+                "title": f"MoviePilot MCP OpenAPI{title_suffix}",
+                "description": f"MoviePilot 内置 Agent 工具的 REST 接口，由 MoviePilotMCP 插件动态生成。{description_suffix}",
                 "version": self.plugin_version,
             },
             "servers": [{"url": base_url}],
@@ -839,6 +867,46 @@ class MoviePilotMCP(_PluginBase):
             },
         }
 
+    async def _fetch_and_split_tools(self) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Optional[str]]:
+        """获取所有工具并按只读/写操作拆分。返回 (readonly_tools, write_tools, error)。"""
+        tools, error = await self._fetch_mcp_tools()
+        if error:
+            return [], [], error
+        readonly_tools = [t for t in tools if t.get("name") not in self._write_tool_names]
+        write_tools = [t for t in tools if t.get("name") in self._write_tool_names]
+        return readonly_tools, write_tools, None
+
+    async def handle_openapi_spec(self, request: Request):
+        """动态生成 OpenAPI 3.0.3 规范文档 — 仅包含只读工具（无需认证）。"""
+        if not self._enabled:
+            raise HTTPException(status_code=403, detail="MoviePilot MCP 包装层未启用")
+
+        readonly_tools, _, error = await self._fetch_and_split_tools()
+        if error:
+            raise HTTPException(status_code=502, detail=error)
+
+        base_url = str(request.base_url).rstrip("/")
+        spec = self._build_openapi_spec(readonly_tools, base_url)
+        return JSONResponse(spec)
+
+    async def handle_openapi_write_spec(self, request: Request):
+        """动态生成 OpenAPI 3.0.3 规范文档 — 仅包含写操作工具（无需认证）。"""
+        if not self._enabled:
+            raise HTTPException(status_code=403, detail="MoviePilot MCP 包装层未启用")
+        if not self._enable_write_tools:
+            raise HTTPException(status_code=403, detail="写操作工具已关闭，请在插件配置中启用")
+
+        _, write_tools, error = await self._fetch_and_split_tools()
+        if error:
+            raise HTTPException(status_code=502, detail=error)
+
+        base_url = str(request.base_url).rstrip("/")
+        spec = self._build_openapi_spec(
+            write_tools,
+            base_url,
+            title_suffix="（写操作）",
+            description_suffix="当前 spec 仅包含写操作工具。",
+        )
         return JSONResponse(spec)
 
     async def handle_protected_resource_metadata(self, _: Request):
@@ -1721,6 +1789,9 @@ class MoviePilotMCP(_PluginBase):
 
     def _build_openapi_spec_url(self) -> str:
         return self._absolute_url(self._plugin_api_path("/openapi.json"))
+
+    def _build_openapi_write_spec_url(self) -> str:
+        return self._absolute_url(self._plugin_api_path("/openapi.write.json"))
 
     def _plugin_api_path(self, suffix: str = "") -> str:
         return f"{settings.API_V1_STR}/plugin/{self.__class__.__name__}{suffix}"
