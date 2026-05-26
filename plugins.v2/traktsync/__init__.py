@@ -137,7 +137,7 @@ class TraktSync(_PluginBase):
 
     plugin_author = "cyt-666"
 
-    plugin_version = "0.3.2"
+    plugin_version = "0.3.3"
 
     author_url = "https://github.com/cyt-666/MoviePilot-Plugins"
 
@@ -498,15 +498,20 @@ class TraktSync(_PluginBase):
             ("_enable_anticipated_movies", "anticipated", "movies"): ("Trakt 待映电影", "Movie"),
             ("_enable_anticipated_shows", "anticipated", "shows"): ("Trakt 待映剧集", "TV"),
         }
+        added = []
         for (config_attr, list_type, media_type), (name, type_str) in source_map.items():
-            if getattr(self, config_attr, False):
+            enabled = getattr(self, config_attr, False)
+            if enabled:
+                api_path = f"plugin/TraktSync/trakt_{list_type}_{media_type}"
                 event_data.extra_sources.append(
                     RecommendMediaSource(
                         name=name,
-                        api_path=f"plugin/TraktSync/trakt_{list_type}_{media_type}",
+                        api_path=api_path,
                         type=type_str,
                     )
                 )
+                added.append(name)
+        logger.info(f"TraktSync 添加了 {len(added)} 个推荐源: {added}")
 
     def get_agent_tools(self) -> list:
         """
