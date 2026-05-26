@@ -16,7 +16,7 @@ from app.db.user_oper import UserOper
 from pydantic import BaseModel, Field
 
 from app.schemas.types import MediaType, EventType, ChainEventType, SystemConfigKey
-from app.schemas.event import RecommendSourceEventData, RecommendMediaSource
+from app.schemas.event import DiscoverSourceEventData, DiscoverMediaSource
 from app.agent.tools.base import MoviePilotTool
 
 from app.chain.download import DownloadChain
@@ -137,7 +137,7 @@ class TraktSync(_PluginBase):
 
     plugin_author = "cyt-666"
 
-    plugin_version = "0.3.3"
+    plugin_version = "0.4.0"
 
     author_url = "https://github.com/cyt-666/MoviePilot-Plugins"
 
@@ -478,40 +478,41 @@ class TraktSync(_PluginBase):
         logger.info(f"TraktSync 注册 {len(apis)} 个API端点: {[a['path'] for a in apis]}")
         return apis
 
-    @eventmanager.register(ChainEventType.RecommendSource)
-    def _on_recommend_source(self, event: Event):
+    @eventmanager.register(ChainEventType.DiscoverSource)
+    def _on_discover_source(self, event: Event):
         """
-        注册Trakt榜单为推荐数据源
+        注册Trakt榜单为探索数据源
         """
-        logger.info("TraktSync _on_recommend_source 事件触发")
+        logger.info("TraktSync _on_discover_source 事件触发")
         if not self._client_id:
-            logger.warning("TraktSync client_id 未配置，跳过推荐源注册")
+            logger.warning("TraktSync client_id 未配置，跳过探索源注册")
             return
-        event_data: RecommendSourceEventData = event.event_data
+        event_data: DiscoverSourceEventData = event.event_data
         source_map = {
-            ("_enable_popular_movies", "popular", "movies"): ("Trakt 热门电影", "Movie"),
-            ("_enable_popular_shows", "popular", "shows"): ("Trakt 热门剧集", "TV"),
-            ("_enable_trending_movies", "trending", "movies"): ("Trakt 趋势电影", "Movie"),
-            ("_enable_trending_shows", "trending", "shows"): ("Trakt 趋势剧集", "TV"),
-            ("_enable_recommended_movies", "recommended", "movies"): ("Trakt 推荐电影", "Movie"),
-            ("_enable_recommended_shows", "recommended", "shows"): ("Trakt 推荐剧集", "TV"),
-            ("_enable_anticipated_movies", "anticipated", "movies"): ("Trakt 待映电影", "Movie"),
-            ("_enable_anticipated_shows", "anticipated", "shows"): ("Trakt 待映剧集", "TV"),
+            ("_enable_popular_movies", "popular", "movies"): "Trakt 热门电影",
+            ("_enable_popular_shows", "popular", "shows"): "Trakt 热门剧集",
+            ("_enable_trending_movies", "trending", "movies"): "Trakt 趋势电影",
+            ("_enable_trending_shows", "trending", "shows"): "Trakt 趋势剧集",
+            ("_enable_recommended_movies", "recommended", "movies"): "Trakt 推荐电影",
+            ("_enable_recommended_shows", "recommended", "shows"): "Trakt 推荐剧集",
+            ("_enable_anticipated_movies", "anticipated", "movies"): "Trakt 待映电影",
+            ("_enable_anticipated_shows", "anticipated", "shows"): "Trakt 待映剧集",
         }
         added = []
-        for (config_attr, list_type, media_type), (name, type_str) in source_map.items():
+        for (config_attr, list_type, media_type), name in source_map.items():
             enabled = getattr(self, config_attr, False)
             if enabled:
-                api_path = f"plugin/TraktSync/trakt_{list_type}_{media_type}"
+                prefix = f"trakt_{list_type}_{media_type}"
+                api_path = f"plugin/TraktSync/{prefix}"
                 event_data.extra_sources.append(
-                    RecommendMediaSource(
+                    DiscoverMediaSource(
                         name=name,
+                        mediaid_prefix=prefix,
                         api_path=api_path,
-                        type=type_str,
                     )
                 )
                 added.append(name)
-        logger.info(f"TraktSync 添加了 {len(added)} 个推荐源: {added}")
+        logger.info(f"TraktSync 添加了 {len(added)} 个探索源: {added}")
 
     def get_agent_tools(self) -> list:
         """
@@ -702,7 +703,7 @@ class TraktSync(_PluginBase):
                                     {
                                         'component': 'div',
                                         'props': {'class': 'text-h6 mb-2'},
-                                        'text': 'Trakt榜单推荐（显示在推荐页面）'
+                                        'text': 'Trakt榜单推荐（显示在探索页面）'
                                     }
                                 ]
                             }
