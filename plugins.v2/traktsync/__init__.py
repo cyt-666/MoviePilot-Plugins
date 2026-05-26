@@ -137,7 +137,7 @@ class TraktSync(_PluginBase):
 
     plugin_author = "cyt-666"
 
-    plugin_version = "0.3.1"
+    plugin_version = "0.3.2"
 
     author_url = "https://github.com/cyt-666/MoviePilot-Plugins"
 
@@ -475,6 +475,7 @@ class TraktSync(_PluginBase):
                     "summary": f"Trakt {lt} {mt}",
                     "auth": "bear",
                 })
+        logger.info(f"TraktSync 注册 {len(apis)} 个API端点: {[a['path'] for a in apis]}")
         return apis
 
     @eventmanager.register(ChainEventType.RecommendSource)
@@ -482,7 +483,9 @@ class TraktSync(_PluginBase):
         """
         注册Trakt榜单为推荐数据源
         """
+        logger.info("TraktSync _on_recommend_source 事件触发")
         if not self._client_id:
+            logger.warning("TraktSync client_id 未配置，跳过推荐源注册")
             return
         event_data: RecommendSourceEventData = event.event_data
         source_map = {
@@ -918,6 +921,7 @@ class TraktSync(_PluginBase):
         :param page: 页码
         :param limit: 每页数量
         """
+        logger.info(f"TraktSync _fetch_trakt_list: {list_type}/{media_type} page={page}")
         endpoint = self._trakt_list_endpoints.get((list_type, media_type))
         if not endpoint:
             logger.error(f"未知的Trakt榜单类型: {list_type} {media_type}")
@@ -990,6 +994,7 @@ class TraktSync(_PluginBase):
         创建推荐数据的API端点函数
         """
         def endpoint(page: int = 1):
+            logger.info(f"TraktSync API端点被调用: {list_type}/{media_type} page={page}")
             return self._get_trakt_recommendations(list_type, media_type, page)
         return endpoint
 
