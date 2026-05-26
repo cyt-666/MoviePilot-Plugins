@@ -37,11 +37,12 @@
         "name": "Trakt WatchList 同步",
         "description": "Trakt WatchList 同步，提供Trakt榜单推荐数据",
         "labels": "Trakt,WatchList,同步,推荐,热门,趋势",
-        "version": "0.4.2",
+        "version": "0.4.3",
         "icon": "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/trakt.png",
         "author": "cyt-666",
         "level": 2,
         "history": {
+            "v0.4.3": "探索页面Trakt筛选器增加媒体类型层级，先选电影/剧集再选榜单类型。",
             "v0.4.2": "修复探索页面Trakt筛选器芯片不显示文字的问题。",
             "v0.4.1": "8个榜单合并为单个Trakt Tab，通过芯片组筛选器切换榜单类型，避免探索页面标签过多；8个独立API端点合并为1个统一端点。",
             "v0.4.0": "将Trakt榜单数据源从推荐页面迁移至探索页面，探索页面原生支持插件数据源注入，解决推荐页面前端过滤导致插件数据源无法显示的问题。",
