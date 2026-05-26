@@ -137,7 +137,7 @@ class TraktSync(_PluginBase):
 
     plugin_author = "cyt-666"
 
-    plugin_version = "0.4.3"
+    plugin_version = "0.4.4"
 
     author_url = "https://github.com/cyt-666/MoviePilot-Plugins"
 
@@ -472,68 +472,106 @@ class TraktSync(_PluginBase):
     @eventmanager.register(ChainEventType.DiscoverSource)
     def _on_discover_source(self, event: Event):
         """
-        注册Trakt榜单为探索数据源（单个Tab，两层筛选：媒体类型 + 榜单类型）
+        注册Trakt榜单为探索数据源（单个Tab，分组芯片筛选器）
         """
         logger.info("TraktSync _on_discover_source 事件触发")
         if not self._client_id:
             logger.warning("TraktSync client_id 未配置，跳过探索源注册")
             return
 
-        # 检查各类榜单启用状态
-        has_movies = any(getattr(self, attr, False) for attr in [
-            "_enable_popular_movies", "_enable_trending_movies",
-            "_enable_recommended_movies", "_enable_anticipated_movies",
-        ])
-        has_shows = any(getattr(self, attr, False) for attr in [
-            "_enable_popular_shows", "_enable_trending_shows",
-            "_enable_recommended_shows", "_enable_anticipated_shows",
-        ])
+        # 收集已启用的榜单，按媒体类型分组
+        movie_items = []
+        show_items = []
+        list_type_map = {
+            "_enable_popular_movies": ("popular_movies", "热门"),
+            "_enable_trending_movies": ("trending_movies", "趋势"),
+            "_enable_recommended_movies": ("recommended_movies", "推荐"),
+            "_enable_anticipated_movies": ("anticipated_movies", "待映"),
+            "_enable_popular_shows": ("popular_shows", "热门"),
+            "_enable_trending_shows": ("trending_shows", "趋势"),
+            "_enable_recommended_shows": ("recommended_shows", "推荐"),
+            "_enable_anticipated_shows": ("anticipated_shows", "待映"),
+        }
+        for config_attr, (value, title) in list_type_map.items():
+            if getattr(self, config_attr, False):
+                if "movies" in value:
+                    movie_items.append({"value": value, "title": title})
+                else:
+                    show_items.append({"value": value, "title": title})
 
-        if not has_movies and not has_shows:
+        if not movie_items and not show_items:
             logger.info("TraktSync 未启用任何榜单，跳过探索源注册")
             return
 
-        # 媒体类型选项
-        media_type_items = []
-        if has_movies:
-            media_type_items.append({"value": "movies", "title": "电影"})
-        if has_shows:
-            media_type_items.append({"value": "shows", "title": "剧集"})
-        default_media_type = media_type_items[0]["value"]
+        all_items = movie_items + show_items
+        default_list_type = all_items[0]["value"]
 
-        # 榜单类型选项（根据媒体类型动态显示，用 v-show 控制）
-        list_type_map = {
-            "movies": [
-                ("_enable_popular_movies", "popular", "热门"),
-                ("_enable_trending_movies", "trending", "趋势"),
-                ("_enable_recommended_movies", "recommended", "推荐"),
-                ("_enable_anticipated_movies", "anticipated", "待映"),
-            ],
-            "shows": [
-                ("_enable_popular_shows", "popular", "热门"),
-                ("_enable_trending_shows", "trending", "趋势"),
-                ("_enable_recommended_shows", "recommended", "推荐"),
-                ("_enable_anticipated_shows", "anticipated", "待映"),
-            ],
-        }
-
-        # 构建榜单类型芯片（用 v-show 控制显隐）
-        list_type_chips = []
-        for mt in ["movies", "shows"]:
-            for config_attr, value, title in list_type_map[mt]:
-                if getattr(self, config_attr, False):
-                    list_type_chips.append({
-                        "component": "VChip",
-                        "props": {
-                            "value": value,
-                            "filter": True,
-                            "v-show": f"{{{{media_type === '{mt}'}}}}",
+        # 构建筛选器UI：分组标签 + 统一芯片组
+        filter_ui = []
+        if movie_items and show_items:
+            # 两组都有时，加标签分隔
+            movie_chips = [
+                {
+                    "component": "VChip",
+                    "props": {"value": item["value"], "filter": True},
+                    "text": item["title"],
+                }
+                for item in movie_items
+            ]
+            show_chips = [
+                {
+                    "component": "VChip",
+                    "props": {"value": item["value"], "filter": True},
+                    "text": item["title"],
+                }
+                for item in show_items
+            ]
+            filter_ui = [
+                {
+                    "component": "VChipGroup",
+                    "props": {
+                        "model": "list_type",
+                        "mandatory": "force",
+                    },
+                    "content": [
+                        {
+                            "component": "div",
+                            "props": {"class": "text-subtitle-2 font-weight-bold mr-2 align-self-center"},
+                            "text": "电影",
                         },
-                        "text": title,
-                    })
-
-        # 默认榜单类型
-        default_list_type = "popular"
+                        *movie_chips,
+                        {
+                            "component": "VDivider",
+                            "props": {"vertical": True, "class": "mx-2"},
+                        },
+                        {
+                            "component": "div",
+                            "props": {"class": "text-subtitle-2 font-weight-bold mr-2 align-self-center"},
+                            "text": "剧集",
+                        },
+                        *show_chips,
+                    ],
+                },
+            ]
+        else:
+            # 只有一组时不需要标签
+            filter_ui = [
+                {
+                    "component": "VChipGroup",
+                    "props": {
+                        "model": "list_type",
+                        "mandatory": "force",
+                    },
+                    "content": [
+                        {
+                            "component": "VChip",
+                            "props": {"value": item["value"], "filter": True},
+                            "text": item["title"],
+                        }
+                        for item in all_items
+                    ],
+                },
+            ]
 
         event_data: DiscoverSourceEventData = event.event_data
         event_data.extra_sources.append(
@@ -541,49 +579,11 @@ class TraktSync(_PluginBase):
                 name="Trakt",
                 mediaid_prefix="trakt",
                 api_path="plugin/TraktSync/trakt_discover",
-                filter_params={"media_type": default_media_type, "list_type": default_list_type},
-                filter_ui=[
-                    {
-                        "component": "div",
-                        "props": {"class": "text-subtitle-1 font-weight-bold mb-1"},
-                        "text": "媒体类型",
-                    },
-                    {
-                        "component": "VChipGroup",
-                        "props": {
-                            "model": "media_type",
-                            "mandatory": "force",
-                        },
-                        "content": [
-                            {
-                                "component": "VChip",
-                                "props": {
-                                    "value": item["value"],
-                                    "filter": True,
-                                },
-                                "text": item["title"],
-                            }
-                            for item in media_type_items
-                        ],
-                    },
-                    {
-                        "component": "div",
-                        "props": {"class": "text-subtitle-1 font-weight-bold mt-3 mb-1"},
-                        "text": "榜单类型",
-                    },
-                    {
-                        "component": "VChipGroup",
-                        "props": {
-                            "model": "list_type",
-                            "mandatory": "force",
-                        },
-                        "content": list_type_chips,
-                    },
-                ],
-                depends={"list_type": ["media_type"]},
+                filter_params={"list_type": default_list_type},
+                filter_ui=filter_ui,
             )
         )
-        logger.info(f"TraktSync 添加探索源: Trakt (电影={has_movies}, 剧集={has_shows})")
+        logger.info(f"TraktSync 添加探索源: Trakt (电影={len(movie_items)}, 剧集={len(show_items)})")
 
     def get_agent_tools(self) -> list:
         """
@@ -1066,17 +1066,18 @@ class TraktSync(_PluginBase):
         self.save_data(cache_key, {"data": results, "timestamp": time.time()})
         return results
 
-    def _trakt_discover_endpoint(self, media_type: str = "movies", list_type: str = "popular", page: int = 1):
+    def _trakt_discover_endpoint(self, list_type: str = "popular_movies", page: int = 1):
         """
         统一的Trakt榜单探索端点
-        :param media_type: movies 或 shows
-        :param list_type: popular/trending/recommended/anticipated
+        :param list_type: 榜单类型，如 popular_movies, trending_shows 等
         :param page: 页码
         """
-        if media_type not in ("movies", "shows") or list_type not in ("popular", "trending", "recommended", "anticipated"):
+        parts = list_type.rsplit("_", 1)
+        if len(parts) != 2 or parts[0] not in ("popular", "trending", "recommended", "anticipated") or parts[1] not in ("movies", "shows"):
             return []
-        logger.info(f"TraktSync 探索端点被调用: {list_type}/{media_type} page={page}")
-        return self._get_trakt_recommendations(list_type, media_type, page)
+        list_category, media_type = parts
+        logger.info(f"TraktSync 探索端点被调用: {list_category}/{media_type} page={page}")
+        return self._get_trakt_recommendations(list_category, media_type, page)
 
     def sync_watchlist(self):
         token = self.get_data("token")
