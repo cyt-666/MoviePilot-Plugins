@@ -35,13 +35,14 @@
     },
     "TraktSync": {
         "name": "Trakt WatchList 同步",
-        "description": "Trakt WatchList 同步",
-        "labels": "Trakt,WatchList,同步",
-        "version": "0.2.1",
+        "description": "Trakt WatchList 同步，提供Trakt榜单推荐数据",
+        "labels": "Trakt,WatchList,同步,推荐,热门,趋势",
+        "version": "0.3.0",
         "icon": "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/trakt.png",
         "author": "cyt-666",
         "level": 2,
         "history": {
+            "v0.3.0": "新增Trakt榜单推荐功能：支持热门、趋势、推荐、待映四类榜单（电影/剧集各4组，共8个数据源），可在推荐页面以轮播卡片展示；新增MCP工具get_trakt_recommendations供智能体调用；榜单数据通过Trakt公开API获取并缓存6小时，仅需配置Client ID即可使用。",
             "v0.2.1": "修复获取watchlist失败的情况下,以及缺失同步历史的情况下，插件崩溃的问题",
             "v0.2.0": "bug修复",
             "v0.1.9": "bug修复",

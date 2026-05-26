@@ -4,7 +4,7 @@ import json
 import time
 from pathlib import Path
 from threading import Lock, Thread
-from typing import Optional, Any, List, Dict, Tuple
+from typing import Optional, Any, List, Dict, Tuple, Type
 
 import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -13,7 +13,11 @@ from apscheduler.triggers.cron import CronTrigger
 from app import schemas
 from app.chain.media import MediaChain
 from app.db.user_oper import UserOper
-from app.schemas.types import MediaType, EventType, SystemConfigKey
+from pydantic import BaseModel, Field
+
+from app.schemas.types import MediaType, EventType, ChainEventType, SystemConfigKey
+from app.schemas.event import RecommendSourceEventData, RecommendMediaSource
+from app.agent.tools.base import MoviePilotTool
 
 from app.chain.download import DownloadChain
 from app.chain.search import SearchChain
@@ -30,17 +34,110 @@ from app.plugins import _PluginBase
 lock = Lock()
 
 
+class GetTraktRecommendationsInput(BaseModel):
+    """获取Trakt榜单推荐的输入参数模型"""
+    explanation: Optional[str] = Field(None, description="Clear explanation of why this tool is being used in the current context")
+    list_type: str = Field(
+        "popular_movies",
+        description=(
+            "Trakt list type to fetch. Values: "
+            "'popular_movies' for popular movies, "
+            "'popular_shows' for popular TV shows, "
+            "'trending_movies' for trending movies, "
+            "'trending_shows' for trending TV shows, "
+            "'recommended_movies' for recommended movies, "
+            "'recommended_shows' for recommended TV shows, "
+            "'anticipated_movies' for most anticipated movies, "
+            "'anticipated_shows' for most anticipated TV shows"
+        )
+    )
+    page: int = Field(1, description="Page number for pagination (default: 1, 20 items per page)")
+
+
+class GetTraktRecommendationsTool(MoviePilotTool):
+    """获取Trakt榜单推荐工具"""
+    name: str = "get_trakt_recommendations"
+    description: str = (
+        "Get media recommendations from Trakt lists. Returns popular, trending, "
+        "recommended, or anticipated movies and TV shows from Trakt. "
+        "Supports pagination with 20 items per page."
+    )
+    args_schema: Type[BaseModel] = GetTraktRecommendationsInput
+    _plugin: Any = None
+
+    def __init__(self, session_id: str, user_id: str, plugin_instance=None):
+        super().__init__(session_id=session_id, user_id=user_id)
+        self._plugin = plugin_instance
+
+    def get_tool_message(self, **kwargs) -> Optional[str]:
+        list_type = kwargs.get("list_type", "popular_movies")
+        page = kwargs.get("page", 1)
+        type_map = {
+            "popular_movies": "Trakt 热门电影",
+            "popular_shows": "Trakt 热门剧集",
+            "trending_movies": "Trakt 趋势电影",
+            "trending_shows": "Trakt 趋势剧集",
+            "recommended_movies": "Trakt 推荐电影",
+            "recommended_shows": "Trakt 推荐剧集",
+            "anticipated_movies": "Trakt 待映电影",
+            "anticipated_shows": "Trakt 待映剧集",
+        }
+        desc = type_map.get(list_type, list_type)
+        return f"获取Trakt榜单: {desc} (第{page}页)"
+
+    async def run(self, list_type: str = "popular_movies", page: int = 1, **kwargs) -> str:
+        page = max(1, page or 1)
+        parts = list_type.rsplit("_", 1)
+        if len(parts) != 2 or parts[0] not in ("popular", "trending", "recommended", "anticipated") or parts[1] not in ("movies", "shows"):
+            return (
+                f"无效的list_type: {list_type}。支持的值: "
+                "popular_movies, popular_shows, trending_movies, trending_shows, "
+                "recommended_movies, recommended_shows, anticipated_movies, anticipated_shows"
+            )
+        list_category, media_type = parts
+        if not self._plugin:
+            return "Trakt插件实例未初始化"
+        try:
+            results = self._plugin._get_trakt_recommendations(list_category, media_type, page)
+        except Exception as e:
+            return f"获取Trakt推荐失败: {str(e)}"
+
+        if not results:
+            return "未找到Trakt推荐内容。"
+
+        simplified = []
+        for r in results:
+            if not isinstance(r, dict):
+                continue
+            simplified.append({
+                "title": r.get("title"),
+                "en_title": r.get("en_title"),
+                "year": r.get("year"),
+                "type": r.get("type"),
+                "tmdb_id": r.get("tmdb_id"),
+                "vote_average": r.get("vote_average"),
+                "poster_path": r.get("poster_path"),
+                "detail_link": r.get("detail_link"),
+            })
+        result_json = json.dumps(simplified, ensure_ascii=False, indent=2)
+        has_more = len(results) >= 20
+        payload_msg = f"第 {page} 页，当前页 {len(simplified)} 条结果。"
+        if has_more:
+            payload_msg += f" 可能有更多数据，可使用 page={page + 1} 获取下一页。"
+        return f"{payload_msg}\n\n{result_json}"
+
+
 class TraktSync(_PluginBase):
 
     plugin_name = "Trakt Watchlist Sync"
 
-    plugin_desc = "同步Trakt的watch list并添加订阅"
+    plugin_desc = "同步Trakt的watch list并添加订阅，提供Trakt榜单推荐数据"
 
     plugin_icon = "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/trakt.png"
 
     plugin_author = "cyt-666"
 
-    plugin_version = "0.2.1"
+    plugin_version = "0.3.0"
 
     author_url = "https://github.com/cyt-666/MoviePilot-Plugins"
 
@@ -59,6 +156,20 @@ class TraktSync(_PluginBase):
     _refresh_token_url = "https://api.trakt.tv/oauth/token"
 
     _watchlist_url = "https://api.trakt.tv/sync/watchlist"
+
+    _trakt_api_base = "https://api.trakt.tv"
+
+    # 公开端点，仅需 trakt-api-key (client_id)，无需 OAuth token
+    _trakt_list_endpoints = {
+        ("popular", "movies"): "/movies/popular",
+        ("popular", "shows"): "/shows/popular",
+        ("trending", "movies"): "/movies/trending",
+        ("trending", "shows"): "/shows/trending",
+        ("recommended", "movies"): "/movies/recommended/weekly",
+        ("recommended", "shows"): "/shows/recommended/weekly",
+        ("anticipated", "movies"): "/movies/anticipated",
+        ("anticipated", "shows"): "/shows/anticipated",
+    }
 
 
 
@@ -83,6 +194,16 @@ class TraktSync(_PluginBase):
     _client_secret: str = ""
 
     _media_type: str = ""
+
+    # Trakt 榜单推荐开关
+    _enable_popular_movies: bool = False
+    _enable_popular_shows: bool = False
+    _enable_trending_movies: bool = False
+    _enable_trending_shows: bool = False
+    _enable_recommended_movies: bool = False
+    _enable_recommended_shows: bool = False
+    _enable_anticipated_movies: bool = False
+    _enable_anticipated_shows: bool = False
 
     def _threaded_token_request(self, device_code: str, interval: int, count: int):
         """
@@ -113,6 +234,14 @@ class TraktSync(_PluginBase):
             self._media_type = config.get("media_type")
             self._client_id = config.get("client_id")
             self._client_secret = config.get("client_secret")
+            self._enable_popular_movies = config.get("enable_popular_movies", False)
+            self._enable_popular_shows = config.get("enable_popular_shows", False)
+            self._enable_trending_movies = config.get("enable_trending_movies", False)
+            self._enable_trending_shows = config.get("enable_trending_shows", False)
+            self._enable_recommended_movies = config.get("enable_recommended_movies", False)
+            self._enable_recommended_shows = config.get("enable_recommended_shows", False)
+            self._enable_anticipated_movies = config.get("enable_anticipated_movies", False)
+            self._enable_anticipated_shows = config.get("enable_anticipated_shows", False)
 
             if not self._client_id or not self._client_secret:
                 logger.error("Trakt Client ID 或 Client Secret 未设置")
@@ -170,7 +299,15 @@ class TraktSync(_PluginBase):
             "cron": self._cron,
             "media_type": self._media_type,
             "client_id": self._client_id,
-            "client_secret": self._client_secret
+            "client_secret": self._client_secret,
+            "enable_popular_movies": self._enable_popular_movies,
+            "enable_popular_shows": self._enable_popular_shows,
+            "enable_trending_movies": self._enable_trending_movies,
+            "enable_trending_shows": self._enable_trending_shows,
+            "enable_recommended_movies": self._enable_recommended_movies,
+            "enable_recommended_shows": self._enable_recommended_shows,
+            "enable_anticipated_movies": self._enable_anticipated_movies,
+            "enable_anticipated_shows": self._enable_anticipated_shows,
         })  
     
 
@@ -316,7 +453,7 @@ class TraktSync(_PluginBase):
             "summary": "API说明"
         }]
         """
-        return [
+        apis = [
             {
                 "path": "/delete_history",
                 "endpoint": self.delete_history,
@@ -324,6 +461,59 @@ class TraktSync(_PluginBase):
                 "summary": "删除Trakt同步历史记录"
             }
         ]
+        # 添加Trakt榜单推荐API端点
+        list_types = ["popular", "trending", "recommended", "anticipated"]
+        media_types = ["movies", "shows"]
+        for lt in list_types:
+            for mt in media_types:
+                endpoint_name = f"trakt_{lt}_{mt}"
+                apis.append({
+                    "path": f"/{endpoint_name}",
+                    "endpoint": self._create_recommend_endpoint(lt, mt),
+                    "methods": ["GET"],
+                    "summary": f"Trakt {lt} {mt}",
+                })
+        return apis
+
+    @eventmanager.register(ChainEventType.RecommendSource)
+    def _on_recommend_source(self, event: Event):
+        """
+        注册Trakt榜单为推荐数据源
+        """
+        if not self._client_id:
+            return
+        event_data: RecommendSourceEventData = event.event_data
+        source_map = {
+            ("_enable_popular_movies", "popular", "movies"): ("Trakt 热门电影", "Movie"),
+            ("_enable_popular_shows", "popular", "shows"): ("Trakt 热门剧集", "TV"),
+            ("_enable_trending_movies", "trending", "movies"): ("Trakt 趋势电影", "Movie"),
+            ("_enable_trending_shows", "trending", "shows"): ("Trakt 趋势剧集", "TV"),
+            ("_enable_recommended_movies", "recommended", "movies"): ("Trakt 推荐电影", "Movie"),
+            ("_enable_recommended_shows", "recommended", "shows"): ("Trakt 推荐剧集", "TV"),
+            ("_enable_anticipated_movies", "anticipated", "movies"): ("Trakt 待映电影", "Movie"),
+            ("_enable_anticipated_shows", "anticipated", "shows"): ("Trakt 待映剧集", "TV"),
+        }
+        for (config_attr, list_type, media_type), (name, type_str) in source_map.items():
+            if getattr(self, config_attr, False):
+                event_data.extra_sources.append(
+                    RecommendMediaSource(
+                        name=name,
+                        api_path=f"plugin/TraktSync/trakt_{list_type}_{media_type}",
+                        type=type_str,
+                    )
+                )
+
+    def get_agent_tools(self) -> list:
+        """
+        返回Trakt推荐工具供智能体调用
+        """
+        if not self._client_id:
+            return []
+        plugin_ref = self
+        class BoundTool(GetTraktRecommendationsTool):
+            def __init__(tool_self, session_id, user_id):
+                super().__init__(session_id, user_id, plugin_instance=plugin_ref)
+        return [BoundTool]
 
     def get_state(self) -> bool:
         return self._enabled
@@ -487,6 +677,140 @@ class TraktSync(_PluginBase):
                                 ]
                             }
                         ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
+                                    {
+                                        'component': 'VDivider',
+                                        'props': {'class': 'my-2'}
+                                    },
+                                    {
+                                        'component': 'div',
+                                        'props': {'class': 'text-h6 mb-2'},
+                                        'text': 'Trakt榜单推荐（显示在推荐页面）'
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'enable_popular_movies',
+                                            'label': '热门电影',
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'enable_trending_movies',
+                                            'label': '趋势电影',
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'enable_recommended_movies',
+                                            'label': '推荐电影',
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'enable_anticipated_movies',
+                                            'label': '待映电影',
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'enable_popular_shows',
+                                            'label': '热门剧集',
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'enable_trending_shows',
+                                            'label': '趋势剧集',
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'enable_recommended_shows',
+                                            'label': '推荐剧集',
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 3},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'enable_anticipated_shows',
+                                            'label': '待映剧集',
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
                     }
                 ]
             }
@@ -497,7 +821,15 @@ class TraktSync(_PluginBase):
             "cron": "*/30 * * * *",
             "media_type": "all",
             "client_id": "",
-            "client_secret": ""
+            "client_secret": "",
+            "enable_popular_movies": False,
+            "enable_popular_shows": False,
+            "enable_trending_movies": False,
+            "enable_trending_shows": False,
+            "enable_recommended_movies": False,
+            "enable_recommended_shows": False,
+            "enable_anticipated_movies": False,
+            "enable_anticipated_shows": False,
         }
 
 
@@ -575,7 +907,89 @@ class TraktSync(_PluginBase):
         except Exception as e:
             logger.error(f"Trakt get watchlist failed: {e}")
             return None
-    
+
+    def _fetch_trakt_list(self, list_type: str, media_type: str, page: int = 1, limit: int = 20) -> Optional[list]:
+        """
+        从Trakt公开API获取榜单数据（无需OAuth token）
+        :param list_type: popular/trending/recommended/anticipated
+        :param media_type: movies/shows
+        :param page: 页码
+        :param limit: 每页数量
+        """
+        endpoint = self._trakt_list_endpoints.get((list_type, media_type))
+        if not endpoint:
+            logger.error(f"未知的Trakt榜单类型: {list_type} {media_type}")
+            return None
+        url = f"{self._trakt_api_base}{endpoint}"
+        headers = {
+            "Content-Type": "application/json",
+            "trakt-api-version": "2",
+            "trakt-api-key": self._client_id,
+        }
+        params = {"page": page, "limit": limit}
+        try:
+            response = requests.get(url, headers=headers, params=params)
+            response.raise_for_status()
+            return json.loads(response.text)
+        except Exception as e:
+            logger.error(f"Trakt获取{list_type} {media_type}失败: {e}")
+            return None
+
+    def _trakt_item_to_mediainfo(self, trakt_item: dict, media_type_str: str):
+        """
+        将Trakt条目转换为MediaInfo
+        :param trakt_item: Trakt API返回的条目（已提取出movie/show对象）
+        :param media_type_str: "movies" 或 "shows"
+        """
+        ids = trakt_item.get("ids", {})
+        tmdb_id = ids.get("tmdb")
+        if not tmdb_id:
+            return None
+        title = trakt_item.get("title", "")
+        meta = MetaInfo(title=title)
+        meta.type = MediaType.MOVIE if media_type_str == "movies" else MediaType.TV
+        try:
+            mediainfo = self.chain.recognize_media(meta=meta, tmdbid=tmdb_id)
+            return mediainfo
+        except Exception as e:
+            logger.error(f"识别媒体失败: {title} (tmdb:{tmdb_id}) - {e}")
+            return None
+
+    def _get_trakt_recommendations(self, list_type: str, media_type: str, page: int = 1) -> List[dict]:
+        """
+        获取Trakt榜单推荐数据（带缓存，6小时TTL）
+        :param list_type: popular/trending/recommended/anticipated
+        :param media_type: movies/shows
+        :param page: 页码
+        """
+        cache_key = f"trakt_cache_{list_type}_{media_type}_{page}"
+        cached = self.get_data(cache_key)
+        if cached and time.time() - cached.get("timestamp", 0) < 6 * 3600:
+            return cached.get("data", [])
+
+        raw_items = self._fetch_trakt_list(list_type, media_type, page=page)
+        if not raw_items:
+            return []
+
+        results = []
+        for item in raw_items:
+            # trending/recommended 返回格式: {watchers: N, movie/show: {...}}
+            # popular/anticipated 返回格式: {title, year, ids: {...}}
+            media_obj = item.get("movie") or item.get("show") or item
+            mediainfo = self._trakt_item_to_mediainfo(media_obj, media_type)
+            if mediainfo:
+                results.append(mediainfo.to_dict())
+
+        self.save_data(cache_key, {"data": results, "timestamp": time.time()})
+        return results
+
+    def _create_recommend_endpoint(self, list_type: str, media_type: str):
+        """
+        创建推荐数据的API端点函数
+        """
+        def endpoint(page: int = 1):
+            return self._get_trakt_recommendations(list_type, media_type, page)
+        return endpoint
 
     def sync_watchlist(self):
         token = self.get_data("token")
