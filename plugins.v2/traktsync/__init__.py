@@ -137,7 +137,7 @@ class TraktSync(_PluginBase):
 
     plugin_author = "cyt-666"
 
-    plugin_version = "0.3.0"
+    plugin_version = "0.3.1"
 
     author_url = "https://github.com/cyt-666/MoviePilot-Plugins"
 
@@ -462,6 +462,7 @@ class TraktSync(_PluginBase):
             }
         ]
         # 添加Trakt榜单推荐API端点
+        # auth设为"bear"，使用verify_token认证，与推荐页面前端的JWT Bearer Token兼容
         list_types = ["popular", "trending", "recommended", "anticipated"]
         media_types = ["movies", "shows"]
         for lt in list_types:
@@ -472,6 +473,7 @@ class TraktSync(_PluginBase):
                     "endpoint": self._create_recommend_endpoint(lt, mt),
                     "methods": ["GET"],
                     "summary": f"Trakt {lt} {mt}",
+                    "auth": "bear",
                 })
         return apis
 
