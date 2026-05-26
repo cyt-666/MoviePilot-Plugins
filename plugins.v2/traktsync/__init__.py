@@ -137,7 +137,7 @@ class TraktSync(_PluginBase):
 
     plugin_author = "cyt-666"
 
-    plugin_version = "0.4.1"
+    plugin_version = "0.4.2"
 
     author_url = "https://github.com/cyt-666/MoviePilot-Plugins"
 
@@ -510,6 +510,11 @@ class TraktSync(_PluginBase):
                 filter_params={"list_type": default_list_type},
                 filter_ui=[
                     {
+                        "component": "div",
+                        "props": {"class": "text-subtitle-1 font-weight-bold mb-1"},
+                        "text": "榜单类型",
+                    },
+                    {
                         "component": "VChipGroup",
                         "props": {
                             "model": "list_type",
@@ -520,9 +525,9 @@ class TraktSync(_PluginBase):
                                 "component": "VChip",
                                 "props": {
                                     "value": item["value"],
-                                    "label": item["title"],
                                     "filter": True,
                                 },
+                                "text": item["title"],
                             }
                             for item in chip_items
                         ],
