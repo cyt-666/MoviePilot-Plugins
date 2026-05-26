@@ -137,7 +137,7 @@ class TraktSync(_PluginBase):
 
     plugin_author = "cyt-666"
 
-    plugin_version = "0.4.0"
+    plugin_version = "0.4.1"
 
     author_url = "https://github.com/cyt-666/MoviePilot-Plugins"
 
@@ -453,66 +453,84 @@ class TraktSync(_PluginBase):
             "summary": "API说明"
         }]
         """
-        apis = [
+        return [
             {
                 "path": "/delete_history",
                 "endpoint": self.delete_history,
                 "methods": ["GET"],
                 "summary": "删除Trakt同步历史记录"
-            }
+            },
+            {
+                "path": "/trakt_discover",
+                "endpoint": self._trakt_discover_endpoint,
+                "methods": ["GET"],
+                "summary": "Trakt榜单探索数据",
+                "auth": "bear",
+            },
         ]
-        # 添加Trakt榜单推荐API端点
-        # auth设为"bear"，使用verify_token认证，与推荐页面前端的JWT Bearer Token兼容
-        list_types = ["popular", "trending", "recommended", "anticipated"]
-        media_types = ["movies", "shows"]
-        for lt in list_types:
-            for mt in media_types:
-                endpoint_name = f"trakt_{lt}_{mt}"
-                apis.append({
-                    "path": f"/{endpoint_name}",
-                    "endpoint": self._create_recommend_endpoint(lt, mt),
-                    "methods": ["GET"],
-                    "summary": f"Trakt {lt} {mt}",
-                    "auth": "bear",
-                })
-        logger.info(f"TraktSync 注册 {len(apis)} 个API端点: {[a['path'] for a in apis]}")
-        return apis
 
     @eventmanager.register(ChainEventType.DiscoverSource)
     def _on_discover_source(self, event: Event):
         """
-        注册Trakt榜单为探索数据源
+        注册Trakt榜单为探索数据源（单个Tab，内嵌榜单类型筛选器）
         """
         logger.info("TraktSync _on_discover_source 事件触发")
         if not self._client_id:
             logger.warning("TraktSync client_id 未配置，跳过探索源注册")
             return
-        event_data: DiscoverSourceEventData = event.event_data
+
+        # 收集已启用的榜单选项
+        chip_items = []
         source_map = {
-            ("_enable_popular_movies", "popular", "movies"): "Trakt 热门电影",
-            ("_enable_popular_shows", "popular", "shows"): "Trakt 热门剧集",
-            ("_enable_trending_movies", "trending", "movies"): "Trakt 趋势电影",
-            ("_enable_trending_shows", "trending", "shows"): "Trakt 趋势剧集",
-            ("_enable_recommended_movies", "recommended", "movies"): "Trakt 推荐电影",
-            ("_enable_recommended_shows", "recommended", "shows"): "Trakt 推荐剧集",
-            ("_enable_anticipated_movies", "anticipated", "movies"): "Trakt 待映电影",
-            ("_enable_anticipated_shows", "anticipated", "shows"): "Trakt 待映剧集",
+            "_enable_popular_movies": {"value": "popular_movies", "title": "热门电影"},
+            "_enable_popular_shows": {"value": "popular_shows", "title": "热门剧集"},
+            "_enable_trending_movies": {"value": "trending_movies", "title": "趋势电影"},
+            "_enable_trending_shows": {"value": "trending_shows", "title": "趋势剧集"},
+            "_enable_recommended_movies": {"value": "recommended_movies", "title": "推荐电影"},
+            "_enable_recommended_shows": {"value": "recommended_shows", "title": "推荐剧集"},
+            "_enable_anticipated_movies": {"value": "anticipated_movies", "title": "待映电影"},
+            "_enable_anticipated_shows": {"value": "anticipated_shows", "title": "待映剧集"},
         }
-        added = []
-        for (config_attr, list_type, media_type), name in source_map.items():
-            enabled = getattr(self, config_attr, False)
-            if enabled:
-                prefix = f"trakt_{list_type}_{media_type}"
-                api_path = f"plugin/TraktSync/{prefix}"
-                event_data.extra_sources.append(
-                    DiscoverMediaSource(
-                        name=name,
-                        mediaid_prefix=prefix,
-                        api_path=api_path,
-                    )
-                )
-                added.append(name)
-        logger.info(f"TraktSync 添加了 {len(added)} 个探索源: {added}")
+        for config_attr, item in source_map.items():
+            if getattr(self, config_attr, False):
+                chip_items.append(item)
+
+        if not chip_items:
+            logger.info("TraktSync 未启用任何榜单，跳过探索源注册")
+            return
+
+        default_list_type = chip_items[0]["value"]
+
+        event_data: DiscoverSourceEventData = event.event_data
+        event_data.extra_sources.append(
+            DiscoverMediaSource(
+                name="Trakt",
+                mediaid_prefix="trakt",
+                api_path="plugin/TraktSync/trakt_discover",
+                filter_params={"list_type": default_list_type},
+                filter_ui=[
+                    {
+                        "component": "VChipGroup",
+                        "props": {
+                            "model": "list_type",
+                            "mandatory": "force",
+                        },
+                        "content": [
+                            {
+                                "component": "VChip",
+                                "props": {
+                                    "value": item["value"],
+                                    "label": item["title"],
+                                    "filter": True,
+                                },
+                            }
+                            for item in chip_items
+                        ],
+                    }
+                ],
+            )
+        )
+        logger.info(f"TraktSync 添加探索源: Trakt (含 {len(chip_items)} 个榜单选项)")
 
     def get_agent_tools(self) -> list:
         """
@@ -703,7 +721,7 @@ class TraktSync(_PluginBase):
                                     {
                                         'component': 'div',
                                         'props': {'class': 'text-h6 mb-2'},
-                                        'text': 'Trakt榜单推荐（显示在探索页面）'
+                                        'text': 'Trakt榜单探索（启用的榜单会出现在筛选器中）'
                                     }
                                 ]
                             }
@@ -995,14 +1013,18 @@ class TraktSync(_PluginBase):
         self.save_data(cache_key, {"data": results, "timestamp": time.time()})
         return results
 
-    def _create_recommend_endpoint(self, list_type: str, media_type: str):
+    def _trakt_discover_endpoint(self, list_type: str = "popular_movies", page: int = 1):
         """
-        创建推荐数据的API端点函数
+        统一的Trakt榜单探索端点
+        :param list_type: 榜单类型，如 popular_movies, trending_shows 等
+        :param page: 页码
         """
-        def endpoint(page: int = 1):
-            logger.info(f"TraktSync API端点被调用: {list_type}/{media_type} page={page}")
-            return self._get_trakt_recommendations(list_type, media_type, page)
-        return endpoint
+        parts = list_type.rsplit("_", 1)
+        if len(parts) != 2 or parts[0] not in ("popular", "trending", "recommended", "anticipated") or parts[1] not in ("movies", "shows"):
+            return []
+        list_category, media_type = parts
+        logger.info(f"TraktSync 探索端点被调用: {list_category}/{media_type} page={page}")
+        return self._get_trakt_recommendations(list_category, media_type, page)
 
     def sync_watchlist(self):
         token = self.get_data("token")
