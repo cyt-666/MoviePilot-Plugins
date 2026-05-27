@@ -137,7 +137,7 @@ class TraktSync(_PluginBase):
 
     plugin_author = "cyt-666"
 
-    plugin_version = "0.4.4"
+    plugin_version = "0.4.5"
 
     author_url = "https://github.com/cyt-666/MoviePilot-Plugins"
 
@@ -923,7 +923,7 @@ class TraktSync(_PluginBase):
             "Content-Type": "application/json",
         }
         try:
-            response = requests.post(self._device_code_url, json=data, headers=headers)
+            response = requests.post(self._device_code_url, json=data, headers=headers, proxies=settings.PROXY)
             response.raise_for_status()
             return json.loads(response.text)
         except Exception as e:
@@ -942,7 +942,7 @@ class TraktSync(_PluginBase):
             "Content-Type": "application/json",
         }
         try:
-            response = requests.post(self._token_url, json=data, headers=headers)
+            response = requests.post(self._token_url, json=data, headers=headers, proxies=settings.PROXY)
             response.raise_for_status()
             result = json.loads(response.text)
             result["expired_at"] = result.get("created_at") + 24 * 3600
@@ -964,7 +964,7 @@ class TraktSync(_PluginBase):
             "Content-Type": "application/json",
         }
         try:
-            response = requests.post(self._refresh_token_url, json=data, headers=headers)
+            response = requests.post(self._refresh_token_url, json=data, headers=headers, proxies=settings.PROXY)
             response.raise_for_status()
             result = json.loads(response.text)
             result["expired_at"] = result.get("created_at") + 24 * 3600
@@ -983,7 +983,7 @@ class TraktSync(_PluginBase):
         }
         url = f"{self._watchlist_url}/{self._media_type}/title/asc"
         try:
-            response = requests.get(url, headers=headers)
+            response = requests.get(url, headers=headers, proxies=settings.PROXY)
             response.raise_for_status()
             return json.loads(response.text)
         except Exception as e:
@@ -1011,7 +1011,7 @@ class TraktSync(_PluginBase):
         }
         params = {"page": page, "limit": limit}
         try:
-            response = requests.get(url, headers=headers, params=params)
+            response = requests.get(url, headers=headers, params=params, proxies=settings.PROXY)
             response.raise_for_status()
             return json.loads(response.text)
         except Exception as e:
