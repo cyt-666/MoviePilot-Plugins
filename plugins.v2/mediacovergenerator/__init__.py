@@ -55,7 +55,7 @@ class MediaCoverGenerator(_PluginBase):
     # 插件图标
     plugin_icon = "mediaplay.png"
     # 插件版本
-    plugin_version = "0.10.2"
+    plugin_version = "0.10.3"
     # 插件作者
     plugin_author = "cyt-666"
     # 作者主页
@@ -3541,6 +3541,10 @@ class MediaCoverGenerator(_PluginBase):
         if not image_path:
             return False
         updated_item_id = self.__get_item_id(item)
+        if not updated_item_id:
+            logger.warning(
+                f"媒体库 {service.name}：{library['Name']} 无法获取媒体项ID，跳过历史记录更新"
+            )
         # 从配置获取背景颜色
         title_result = self.__get_title_from_config(library['Name'])
         config_bg_color = title_result[2] if len(title_result) == 3 else None
@@ -3550,11 +3554,12 @@ class MediaCoverGenerator(_PluginBase):
             return False
         library_id = self.__get_library_item_id(library)
         # 更新id
-        self.update_cover_history(
-            server=service.name, 
-            library_id=library_id, 
-            item_id=updated_item_id
-        )
+        if updated_item_id:
+            self.update_cover_history(
+                server=service.name,
+                library_id=library_id,
+                item_id=updated_item_id
+            )
 
         return image_data
     
@@ -3574,7 +3579,13 @@ class MediaCoverGenerator(_PluginBase):
                 image_path = self.__download_image(service, image_url, library['Name'], count=i+1)
                 if image_path:
                     image_paths.append(image_path)
-                    updated_item_ids.append(self.__get_item_id(item))
+                    updated_item_id = self.__get_item_id(item)
+                    if updated_item_id:
+                        updated_item_ids.append(updated_item_id)
+                    else:
+                        logger.warning(
+                            f"媒体库 {service.name}：{library['Name']} 无法获取媒体项ID，跳过历史记录更新"
+                        )
         
         if len(image_paths) < 1:
             return False
@@ -3758,7 +3769,7 @@ class MediaCoverGenerator(_PluginBase):
         从媒体项信息中获取图片URL
         """
         # Emby/Jellyfin
-        if item['Type'] in 'MusicAlbum,Audio':
+        if item.get("Type") in ("MusicAlbum", "Audio"):
             if item.get("ParentBackdropImageTags") and len(item["ParentBackdropImageTags"]) > 0:
                 item_id = item.get("ParentBackdropItemId")
                 tag = item["ParentBackdropImageTags"][0]
@@ -3869,7 +3880,9 @@ class MediaCoverGenerator(_PluginBase):
         从媒体项信息中获取项目ID
         """
         # Emby/Jellyfin
-        if item['Type'] in 'MusicAlbum,Audio':
+        item_id = None
+
+        if item.get("Type") in ("MusicAlbum", "Audio"):
             if item.get("ParentBackdropImageTags") and len(item["ParentBackdropImageTags"]) > 0:
                 item_id = item.get("ParentBackdropItemId")
             elif item.get("PrimaryImageTag"):
@@ -3877,15 +3890,33 @@ class MediaCoverGenerator(_PluginBase):
             elif item.get("AlbumPrimaryImageTag"):
                 item_id = item.get("AlbumId")
 
-        elif self._cover_style == 'static_3' or self._cover_style in ['animated_1', 'animated_2', 'animated_3', 'animated_4']:
+        elif self._cover_style == 'static_3' or self._cover_style in [
+            'animated_1', 'animated_2', 'animated_3', 'animated_4'
+        ]:
             if self._use_primary:
-                if (item.get("ImageTags") and item.get("ImageTags").get("Primary")) \
+                if item.get("Type") == 'Episode' and item.get("SeriesPrimaryImageTag"):
+                    item_id = item.get("SeriesId")
+                elif (
+                    item.get("Type") == 'Episode'
+                    and item.get("ParentBackdropImageTags")
+                    and len(item["ParentBackdropImageTags"]) > 0
+                ):
+                    item_id = item.get("ParentBackdropItemId")
+                elif (item.get("ImageTags") and item.get("ImageTags").get("Primary")) \
                     or (item.get("BackdropImageTags") and len(item["BackdropImageTags"]) > 0):
                     item_id = item.get("Id")
                 elif item.get("ParentBackdropImageTags") and len(item["ParentBackdropImageTags"]) > 0:
                     item_id = item.get("ParentBackdropItemId")
             else:
-                if item.get("ParentBackdropImageTags") and len(item["ParentBackdropImageTags"]) > 0:
+                if (
+                    item.get("Type") == 'Episode'
+                    and item.get("ParentBackdropImageTags")
+                    and len(item["ParentBackdropImageTags"]) > 0
+                ):
+                    item_id = item.get("ParentBackdropItemId")
+                elif item.get("Type") == 'Episode' and item.get("SeriesPrimaryImageTag"):
+                    item_id = item.get("SeriesId")
+                elif item.get("ParentBackdropImageTags") and len(item["ParentBackdropImageTags"]) > 0:
                     item_id = item.get("ParentBackdropItemId")
                 elif (item.get("ImageTags") and item.get("ImageTags").get("Primary")) \
                     or (item.get("BackdropImageTags") and len(item["BackdropImageTags"]) > 0):
@@ -3893,19 +3924,35 @@ class MediaCoverGenerator(_PluginBase):
 
         elif self._cover_style.startswith('static'):
             if self._use_primary:
-                if (item.get("BackdropImageTags") and len(item["BackdropImageTags"]) > 0) \
+                if item.get("Type") == 'Episode' and item.get("SeriesPrimaryImageTag"):
+                    item_id = item.get("SeriesId")
+                elif (
+                    item.get("Type") == 'Episode'
+                    and item.get("ParentBackdropImageTags")
+                    and len(item["ParentBackdropImageTags"]) > 0
+                ):
+                    item_id = item.get("ParentBackdropItemId")
+                elif (item.get("BackdropImageTags") and len(item["BackdropImageTags"]) > 0) \
                     or (item.get("ImageTags") and item.get("ImageTags").get("Primary")):
                     item_id = item.get("Id")
                 elif item.get("ParentBackdropImageTags") and len(item["ParentBackdropImageTags"]) > 0:
                     item_id = item.get("ParentBackdropItemId")
             else:
-                if item.get("ParentBackdropImageTags") and len(item["ParentBackdropImageTags"]) > 0:
+                if (
+                    item.get("Type") == 'Episode'
+                    and item.get("ParentBackdropImageTags")
+                    and len(item["ParentBackdropImageTags"]) > 0
+                ):
+                    item_id = item.get("ParentBackdropItemId")
+                elif item.get("Type") == 'Episode' and item.get("SeriesPrimaryImageTag"):
+                    item_id = item.get("SeriesId")
+                elif item.get("ParentBackdropImageTags") and len(item["ParentBackdropImageTags"]) > 0:
                     item_id = item.get("ParentBackdropItemId")
                 elif (item.get("BackdropImageTags") and len(item["BackdropImageTags"]) > 0) \
                     or (item.get("ImageTags") and item.get("ImageTags").get("Primary")):
                     item_id = item.get("Id")
 
-        return item_id
+        return item_id or item.get("Id")
 
     def __download_image(self, service, imageurl, library_name, count=None, retries=3, delay=1):
         """

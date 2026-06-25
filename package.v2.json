@@ -70,11 +70,12 @@
         "name": "媒体库封面生成",
         "description": "生成媒体库动态/静态封面，支持 Emby/Jellyfin",
         "labels": "媒体库,封面,Emby,Jellyfin",
-        "version": "0.10.2",
+        "version": "0.10.3",
         "icon": "mediaplay.png",
         "author": "cyt-666",
         "level": 1,
         "history": {
+            "v0.10.3": "修复 Emby/Jellyfin 多图封面生成时部分剧集条目无法解析 item_id 导致定时任务报 UnboundLocalError 的问题，并在缺少媒体项ID时跳过历史记录更新以保证任务继续执行。",
             "v0.10.2": "修复全新 MoviePilot 安装时插件依赖被拒绝的问题：移除对 MoviePilot 主程序已保护依赖 Pillow、pytz、PyYAML 的固定版本声明，仅安装插件额外需要的 numpy 和 fontTools。",
             "v0.10.1": "新增 fontTools 字体轮廓渲染兜底：当 MoviePilot 容器里的 Pillow/FreeType 能加载字体但无法栅格化文字时，直接读取字体 glyph 轮廓生成文字像素，避免字体校验失败和无字封面。",
             "v0.10.0": "重构封面文字渲染核心：所有静态/动态样式统一走真实像素渲染校验；字体必须实际渲染可见文字才会被使用，失败时自动切换可用字体或拒绝上传无字封面。",
