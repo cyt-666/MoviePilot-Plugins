@@ -41,7 +41,7 @@ class MoviePilotMCP(_PluginBase):
     plugin_name = "MoviePilot MCP Server"
     plugin_desc = "MoviePilot 内置 Agent 工具的 MCP/OpenAPI 双协议对外暴露层，支持 OAuth 2.0 + PKCE 鉴权"
     plugin_icon = "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/moviepilotmcp.svg"
-    plugin_version = "0.7.1"
+    plugin_version = "0.7.2"
     plugin_author = "cyt-666"
     author_url = "https://github.com/cyt-666/MoviePilot-Plugins"
     plugin_config_prefix = "moviepilotmcp_"
@@ -166,6 +166,16 @@ class MoviePilotMCP(_PluginBase):
                 "methods": ["GET"],
                 "summary": "MoviePilot MCP OpenID Connect discovery",
                 "description": "供 VS Code 等 MCP 客户端通过 OIDC path-addition 发现授权服务器元数据",
+                "allow_anonymous": True,
+            },
+            {
+                # Codex 等客户端会把 MCP resource URL 直接作为 issuer，并按
+                # OIDC path-addition 规则访问 {issuer}/.well-known/openid-configuration。
+                "path": "/mcp/.well-known/openid-configuration",
+                "endpoint": self.handle_authorization_server_metadata,
+                "methods": ["GET"],
+                "summary": "MoviePilot MCP resource-scoped OpenID Connect discovery",
+                "description": "供 Codex 等 MCP 客户端从 MCP resource URL 发现授权服务器元数据",
                 "allow_anonymous": True,
             },
             {
@@ -544,19 +554,47 @@ class MoviePilotMCP(_PluginBase):
         if not self._enabled:
             raise HTTPException(status_code=403, detail="MoviePilot MCP 包装层未启用")
 
-        # OAuth Bearer token 验证
-        self._authorize_mcp_request(request)
-
-        # 读取原始请求体（保持字节，避免 re-serialization 丢精度）
+        # 先读取原始请求体做日志识别，但仍保持「先认证、后返回解析错误」的响应语义，
+        # 避免未认证请求借解析错误探测服务端行为。
         body_bytes = await request.body()
+        payload = None
+        parse_error = None
         try:
             payload = json.loads(body_bytes)
         except Exception as err:
+            parse_error = err
+
+        try:
+            access_info = self._authorize_mcp_request(request)
+        except HTTPException:
+            self._log_mcp_request(
+                request=request,
+                payload=payload,
+                access_info=None,
+                result="auth_rejected",
+            )
+            raise
+
+        if parse_error is not None:
+            self._log_mcp_request(
+                request=request,
+                payload=payload,
+                access_info=access_info,
+                result="parse_error",
+            )
+            err = parse_error
             logger.error(f"MoviePilot MCP 请求体解析失败：{err}")
             return JSONResponse(
                 {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}},
                 status_code=400,
             )
+
+        self._log_mcp_request(
+            request=request,
+            payload=payload,
+            access_info=access_info,
+            result="accepted",
+        )
 
         # 统一为列表以支持批量请求
         messages = payload if isinstance(payload, list) else [payload]
@@ -953,15 +991,29 @@ class MoviePilotMCP(_PluginBase):
 
         params = await self._parse_form_request(request)
         grant_type = (params.get("grant_type") or "").strip()
+        client_id = (params.get("client_id") or "").strip()
         if grant_type == "authorization_code":
-            return self._handle_authorization_code_grant(params)
-        if grant_type == "refresh_token":
-            return self._handle_refresh_token_grant(params)
-        return self._oauth_error_response(
-            "unsupported_grant_type",
-            "仅支持 authorization_code 和 refresh_token",
-            status_code=400,
+            response = self._handle_authorization_code_grant(params)
+            auth_method = "oauth_authorization_code_pkce"
+        elif grant_type == "refresh_token":
+            response = self._handle_refresh_token_grant(params)
+            auth_method = "oauth_refresh_token"
+        else:
+            response = self._oauth_error_response(
+                "unsupported_grant_type",
+                "仅支持 authorization_code 和 refresh_token",
+                status_code=400,
+            )
+            auth_method = "oauth_unsupported_grant"
+
+        self._log_oauth_request(
+            request=request,
+            client_id=client_id,
+            auth_method=auth_method,
+            action="token",
+            result="success" if response.status_code < 400 else "rejected",
         )
+        return response
 
     async def handle_client_registration(self, request: Request):
         if not self._enabled:
@@ -1003,6 +1055,11 @@ class MoviePilotMCP(_PluginBase):
             redirect_uris=[str(uri) for uri in redirect_uris],
             grant_types=[str(item) for item in grant_types],
             response_types=[str(item) for item in response_types],
+        )
+        logger.info(
+            "MoviePilot MCP OAuth 请求："
+            f"client={self._safe_log_value(client_name)}, "
+            "auth=oauth_dynamic_client_registration, action=register, result=success"
         )
         client_info = self._get_registered_client(client_id) or {}
         # 按 RFC 7591 返回完整的动态客户端注册元数据，
@@ -1282,6 +1339,118 @@ class MoviePilotMCP(_PluginBase):
 
         self._save_oauth_store(store)
         return access_info
+
+    @staticmethod
+    def _safe_log_value(
+        value: Any, default: str = "unknown", max_length: int = 128
+    ) -> str:
+        """清理日志字段，避免换行注入以及异常长的客户端自报名称。"""
+        text = " ".join(str(value or "").split())
+        if not text:
+            return default
+        if len(text) <= max_length:
+            return text
+        return f"{text[:max_length - 3]}..."
+
+    def _resolve_request_client_name(
+        self,
+        request: Request,
+        payload: Any = None,
+        access_info: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """优先使用 MCP clientInfo，其次使用 OAuth 注册名称，最后回退 User-Agent。"""
+        messages = payload if isinstance(payload, list) else [payload]
+        for message in messages:
+            if not isinstance(message, dict) or message.get("method") != "initialize":
+                continue
+            params = message.get("params")
+            if not isinstance(params, dict):
+                continue
+            client_info = params.get("clientInfo") or {}
+            if isinstance(client_info, dict) and client_info.get("name"):
+                return self._safe_log_value(client_info.get("name"))
+
+        client_id = (access_info or {}).get("client_id")
+        registered_client = self._get_registered_client(client_id) if client_id else None
+        if registered_client and registered_client.get("client_name"):
+            return self._safe_log_value(registered_client.get("client_name"))
+
+        return self._safe_log_value(request.headers.get("user-agent"))
+
+    def _resolve_auth_method(
+        self,
+        request: Request,
+        access_info: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        authorization = request.headers.get("authorization") or ""
+        if not authorization:
+            return "none"
+        if not authorization.startswith("Bearer "):
+            return "unsupported_authorization"
+        if access_info and access_info.get("legacy"):
+            return "legacy_static_token"
+        if access_info:
+            return "oauth_bearer"
+        return "invalid_bearer"
+
+    def _summarize_mcp_action(self, payload: Any) -> str:
+        messages = payload if isinstance(payload, list) else [payload]
+        actions = []
+        for message in messages[:5]:
+            if not isinstance(message, dict):
+                actions.append("invalid_message")
+                continue
+            method = self._safe_log_value(message.get("method"), default="unknown", max_length=64)
+            if method == "tools/call":
+                params = message.get("params")
+                if not isinstance(params, dict):
+                    params = {}
+                tool_name = self._safe_log_value(
+                    params.get("name"),
+                    default="unknown",
+                    max_length=64,
+                )
+                method = f"tools/call({tool_name})"
+            actions.append(method)
+        if len(messages) > 5:
+            actions.append(f"+{len(messages) - 5}_more")
+        return self._safe_log_value(",".join(actions), default="invalid_json", max_length=256)
+
+    def _log_mcp_request(
+        self,
+        request: Request,
+        payload: Any,
+        access_info: Optional[Dict[str, Any]],
+        result: str,
+    ) -> None:
+        client_name = self._resolve_request_client_name(request, payload, access_info)
+        auth_method = self._resolve_auth_method(request, access_info)
+        action = self._summarize_mcp_action(payload)
+        logger.info(
+            "MoviePilot MCP 请求："
+            f"client={client_name}, auth={auth_method}, action={action}, result={result}"
+        )
+
+    def _log_oauth_request(
+        self,
+        request: Request,
+        client_id: str,
+        auth_method: str,
+        action: str,
+        result: str,
+    ) -> None:
+        registered_client = self._get_registered_client(client_id) if client_id else None
+        client_name = (
+            (registered_client or {}).get("client_name")
+            or request.headers.get("user-agent")
+        )
+        logger.info(
+            "MoviePilot MCP OAuth 请求："
+            f"client={self._safe_log_value(client_name)}, "
+            f"auth={self._safe_log_value(auth_method)}, "
+            f"action={self._safe_log_value(action)}, "
+            f"result={self._safe_log_value(result)}"
+        )
 
     async def _parse_form_request(self, request: Request) -> Dict[str, str]:
         body = (await request.body()).decode("utf-8", errors="ignore")
@@ -1776,7 +1945,9 @@ class MoviePilotMCP(_PluginBase):
         return self._absolute_url(self._plugin_api_path("/oauth/register"))
 
     def _build_issuer_url(self) -> str:
-        return self._absolute_url(self._plugin_api_path())
+        # issuer 与受保护的 MCP resource 保持一致，使只能在插件前缀内注册路由的
+        # MoviePilot 也能通过 OIDC path-addition 提供标准 OAuth 元数据。
+        return self._build_endpoint_url()
 
     def _build_authorization_server_metadata_url(self) -> str:
         return self._absolute_url(

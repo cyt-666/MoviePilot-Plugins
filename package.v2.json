@@ -2,12 +2,13 @@
     "MoviePilotMCP": {
         "name": "MoviePilot MCP / OpenAPI Server",
         "description": "MoviePilot 内置 Agent 工具的 MCP/OpenAPI 双协议对外暴露层，支持 OAuth 2.0 + PKCE 鉴权",
-        "labels": "MCP,OpenAPI,ChatGPT,Swagger,自动化,MoviePilot",
-        "version": "0.7.1",
+        "labels": "MCP,OpenAPI,ChatGPT,Codex,Swagger,自动化,MoviePilot",
+        "version": "0.7.2",
         "icon": "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/moviepilotmcp.svg",
         "author": "cyt-666",
         "level": 1,
         "history": {
+            "v0.7.2": "新增 MCP/OAuth 请求审计日志，安全记录 client 名称、认证方式、动作与结果且不输出 Token；将 OAuth issuer 对齐 MCP resource 并新增 /mcp/.well-known/openid-configuration 发现端点，修复 Codex OAuth 元数据发现；补充 Codex 显式登录与工具刷新说明。",
             "v0.7.1": "暂时禁用 OpenAPI 端点对外暴露（代码保留），解决 ChatGPT Actions 无法正常接入的问题。",
             "v0.7.0": "拆分 OpenAPI Spec 为只读和写操作两个独立端点：/openapi.json 仅含只读工具（推荐用于 ChatGPT Actions），/openapi.write.json 仅含写操作工具；移除截断配置，改为按工具类型分 spec 暴露。",
             "v0.5.1": "移除 OpenAPI Spec 端点（/openapi.json）的认证要求，修复 ChatGPT Actions 无法发现 API 的问题。",

@@ -1,6 +1,6 @@
 # MoviePilot MCP / OpenAPI Server
 
-将 MoviePilot 的内置 Agent 工具通过 **MCP（Model Context Protocol）** 和 **OpenAPI（REST）** 双协议暴露给 ChatGPT、VS Code Copilot、Swagger UI、Postman 等客户端，让 AI 助手和自动化脚本可以直接查询订阅、管理下载、整理媒体库等。
+将 MoviePilot 的内置 Agent 工具通过 **MCP（Model Context Protocol）** 和 **OpenAPI（REST）** 双协议暴露给 ChatGPT、Codex、VS Code Copilot、Swagger UI、Postman 等客户端，让 AI 助手和自动化脚本可以直接查询订阅、管理下载、整理媒体库等。
 
 ---
 
@@ -12,7 +12,7 @@
 - **动态 OpenAPI Spec**：根据可用工具自动生成 OpenAPI 3.0 规范文档
 - **51 个工具**：覆盖媒体搜索、订阅管理、下载管理、整理历史、站点管理、消息发送等全部内置 Agent 工具
 - **写操作开关**：可在插件配置中关闭写操作，只读工具仍可正常使用
-- **兼容多客户端**：ChatGPT App、VS Code Copilot、Claude Desktop、Swagger UI、Postman 等
+- **兼容多客户端**：ChatGPT App、Codex、VS Code Copilot、Claude Desktop、Swagger UI、Postman 等
 
 ---
 
@@ -71,6 +71,29 @@
 ```
 
 VS Code 会自动发现 OAuth 配置并引导授权。
+
+---
+
+## 在 Codex 中使用
+
+Codex 添加远程 MCP 后不会自动打开 OAuth 授权页，需要再执行一次显式登录：
+
+```bash
+codex mcp add moviepilot \
+  --url https://你的域名/api/v1/plugin/MoviePilotMCP/mcp
+codex mcp login moviepilot
+codex mcp list
+```
+
+如果已经通过 `config.toml` 或 Codex 设置页面添加了服务器，只需执行：
+
+```bash
+codex mcp login moviepilot
+```
+
+桌面版也可以在 MCP 服务器详情中点击 **Authenticate**。授权完成后，如果当前任务仍看不到
+MoviePilot 工具，请新建任务或重新启用该 MCP，让 Codex 刷新工具列表。搜索种子等慢工具建议在
+Codex 配置中设置 `tool_timeout_sec = 300` 或更高。
 
 ---
 
