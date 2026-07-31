@@ -1,6 +1,6 @@
-# MoviePilot MCP / OpenAPI Server
+# MoviePilot MCP Server
 
-将 MoviePilot 的内置 Agent 工具通过 **MCP（Model Context Protocol）** 和 **OpenAPI（REST）** 双协议暴露给 ChatGPT、Codex、VS Code Copilot、Swagger UI、Postman 等客户端，让 AI 助手和自动化脚本可以直接查询订阅、管理下载、整理媒体库等。
+将 MoviePilot 的内置 Agent 工具通过 **MCP（Model Context Protocol）** 暴露给 ChatGPT、Codex、VS Code Copilot 和 Claude Desktop 等客户端，让 AI 助手可以直接查询订阅、管理下载、整理媒体库等。
 
 ---
 
@@ -8,11 +8,10 @@
 
 - **OAuth 2.0 授权服务器**：完整实现 RFC 6749 授权码流程 + PKCE（RFC 7636），支持动态客户端注册（RFC 7591）
 - **MCP 代理**：完成 OAuth 鉴权后，将 MCP JSON-RPC 请求原样转发至 MoviePilot 内置的 `/api/v1/mcp`
-- **OpenAPI REST 接口**：将 MCP 工具映射为标准 REST API，支持 ChatGPT Actions、Swagger UI、Postman 等 OpenAPI 兼容客户端
-- **动态 OpenAPI Spec**：根据可用工具自动生成 OpenAPI 3.0 规范文档
-- **51 个工具**：覆盖媒体搜索、订阅管理、下载管理、整理历史、站点管理、消息发送等全部内置 Agent 工具
+- **OpenAPI 代码保留**：相关实现暂未注册为对外路由，当前接入方式为 MCP
+- **动态工具集**：与 MoviePilot 内置 MCP 同步，工具数量随 MoviePilot 版本、音频配置和已安装插件变化
 - **写操作开关**：可在插件配置中关闭写操作，只读工具仍可正常使用
-- **兼容多客户端**：ChatGPT App、Codex、VS Code Copilot、Claude Desktop、Swagger UI、Postman 等
+- **兼容多客户端**：ChatGPT App、Codex、VS Code Copilot 和 Claude Desktop
 
 ---
 
@@ -132,63 +131,27 @@ Authorization: Bearer <静态Token>
 
 ## OpenAPI REST 接口
 
-除 MCP JSON-RPC 外，插件同时提供标准 REST API，可通过 OpenAPI spec 接入。
-
-### 端点
-
-| 路径 | 方法 | 说明 |
-|------|------|------|
-| `/openapi.json` | GET | OpenAPI 3.0 规范文档（动态生成） |
-| `/openapi/tools` | GET | 列出所有可用工具 |
-| `/openapi/tools/{tool_name}` | POST | 调用指定工具 |
-
-所有端点均需 OAuth Bearer Token 鉴权（与 MCP 端点一致）。
-
-### 在 ChatGPT Actions 中使用
-
-1. 在 GPT 编辑器中选择「Actions」->「Create new action」
-2. 在「Schema」处选择「Import from URL」，填入插件状态页显示的 **OpenAPI Spec URL**：
-   ```
-   https://你的域名/api/v1/plugin/MoviePilotMCP/openapi.json
-   ```
-3. ChatGPT 会自动解析所有工具定义，在对话中即可调用
-
-### 在 Swagger UI 中使用
-
-1. 打开 [Swagger UI](https://petstore.swagger.io/)
-2. 填入 OpenAPI Spec URL，点击「Explore」
-3. 点击「Authorize」输入 Bearer Token
-4. 即可交互式调用所有工具
-
-### REST 调用示例
-
-```bash
-# 获取工具列表
-curl -H "Authorization: Bearer <token>" \
-  https://你的域名/api/v1/plugin/MoviePilotMCP/openapi/tools
-
-# 搜索媒体
-curl -X POST \
-  -H "Authorization: Bearer <token>" \
-  -H "Content-Type: application/json" \
-  -d '{"title": "Inception", "media_type": "movie"}' \
-  https://你的域名/api/v1/plugin/MoviePilotMCP/openapi/tools/search_media
-
-# 响应格式
-# {"success": true, "result": "..."}
-```
+插件保留了 OpenAPI 代码，但当前版本暂未注册 OpenAPI 路由。请使用上面的 MCP
+JSON-RPC 端点接入 ChatGPT、Codex、VS Code Copilot 或其他 MCP 客户端。
 
 ---
 
 ## 可用工具列表
 
-### 只读工具（32 个）
+插件不再维护固定的工具数量和静态清单。MCP 客户端通过 `tools/list` 获取当前列表，
+列表来源于 MoviePilot 内置 `/api/v1/mcp`，并会受到以下因素影响：
 
-`search_media`、`recognize_media`、`query_media_detail`、`get_recommendations`、`get_search_results`、`search_torrents`、`search_person`、`search_person_credits`、`query_subscribes`、`query_subscribe_history`、`query_subscribe_shares`、`query_popular_subscribes`、`query_download_tasks`、`query_downloaders`、`query_transfer_history`、`query_library_exists`、`query_library_latest`、`query_episode_schedule`、`query_sites`、`query_site_userdata`、`query_schedulers`、`query_workflows`、`query_installed_plugins`、`query_plugin_capabilities`、`query_directory_settings`、`query_rule_groups`、`query_custom_identifiers`、`list_directory`、`list_slash_commands`、`browse_webpage`、`test_site`、`query_download_tasks`
+- MoviePilot 版本中的内置工具变化；
+- `send_voice_message` 等能力开关；
+- 已安装插件提供的 Agent 工具；
+- 内置 MCP 对高风险工具的隐藏规则。
 
-### 写操作工具（20 个，可通过开关关闭）
+当前源码包含 81 个基础工具类。内置 MCP 还会追加 `send_local_file`，音频输出开启时
+追加 `send_voice_message`，并隐藏 `execute_command`、`search_web`、`edit_file`、
+`write_file` 和 `read_file`。因此 81 不是最终对外工具数。
 
-`add_subscribe`、`update_subscribe`、`delete_subscribe`、`search_subscribe`、`add_download`、`modify_download`、`delete_download`、`delete_download_history`、`delete_transfer_history`、`transfer_file`、`scrape_metadata`、`run_scheduler`、`run_workflow`、`run_slash_command`、`update_site`、`update_site_cookie`、`update_custom_identifiers`、`send_message`、`send_voice_message`、`send_local_file`
+关闭「启用写操作工具」后，插件会根据运行时工具的 `write` 标签过滤工具列表，并在
+调用阶段再次拦截写工具。这样可以覆盖 MoviePilot 内置工具和其他插件新增的写工具。
 
 ---
 

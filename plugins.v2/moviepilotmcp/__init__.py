@@ -39,9 +39,9 @@ class MoviePilotMCP(_PluginBase):
     """
 
     plugin_name = "MoviePilot MCP Server"
-    plugin_desc = "MoviePilot 内置 Agent 工具的 MCP/OpenAPI 双协议对外暴露层，支持 OAuth 2.0 + PKCE 鉴权"
+    plugin_desc = "MoviePilot 内置 Agent 工具的 MCP 对外暴露层，支持 OAuth 2.0 + PKCE 鉴权；OpenAPI 代码保留但当前未注册路由"
     plugin_icon = "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/moviepilotmcp.svg"
-    plugin_version = "0.7.2"
+    plugin_version = "0.7.3"
     plugin_author = "cyt-666"
     author_url = "https://github.com/cyt-666/MoviePilot-Plugins"
     plugin_config_prefix = "moviepilotmcp_"
@@ -63,15 +63,28 @@ class MoviePilotMCP(_PluginBase):
         ("app.agent.tools.manager", "MoviePilotToolsManager"),
     ]
 
-    # 内置 MCP 中属于写操作的工具名，用于 _enable_write_tools 开关
+    # 旧版 MoviePilot 不一定暴露工具标签，因此保留一份当前内置工具的完整兜底名单。
+    # 正常情况下 _get_write_tool_names() 会从运行时工具实例的 ToolTag.Write 动态发现，
+    # 避免内置工具改名或插件新增写工具后只读开关失效。
     _write_tool_names: frozenset = frozenset({
-        "add_subscribe", "update_subscribe", "delete_subscribe",
-        "add_download", "modify_download", "delete_download", "delete_download_history",
-        "delete_transfer_history", "run_scheduler", "search_subscribe",
-        "run_workflow", "transfer_file", "scrape_metadata",
-        "update_site", "update_site_cookie", "update_custom_identifiers",
+        "scrape_metadata",
+        "add_subscribe", "update_subscribe", "search_subscribe", "delete_subscribe",
+        "add_download_tasks", "update_download_tasks", "delete_download_tasks",
+        "delete_download_history", "delete_transfer_history",
+        "add_custom_filter_rule", "update_custom_filter_rule", "delete_custom_filter_rule",
+        "add_rule_group", "update_rule_group", "delete_rule_group",
+        "update_site", "update_site_cookie",
+        "transfer_file",
         "send_message", "send_voice_message", "send_local_file",
+        "create_agent_task", "update_agent_task", "run_agent_task", "delete_agent_task",
+        "run_scheduler", "run_workflow",
+        "switch_persona", "update_persona_definition",
+        "update_plugin_config", "reload_plugin", "install_plugin", "uninstall_plugin",
+        "update_custom_identifiers", "update_system_settings",
         "run_slash_command",
+        # 这些工具目前由内置 MCP 隐藏，但保留在写操作集合中，避免未来重新暴露时漏拦截。
+        "edit_file", "write_file",
+        "ask_user_choice",
     })
 
     def __init__(self):
@@ -119,6 +132,38 @@ class MoviePilotMCP(_PluginBase):
         except (TypeError, ValueError):
             timeout = 600
         return max(30, min(timeout, 3600))
+
+    @staticmethod
+    def _tool_has_write_tag(tool: Any) -> bool:
+        """判断运行时工具是否声明了 write 标签。"""
+        tags = getattr(tool, "tags", ())
+        if not tags:
+            return False
+        if isinstance(tags, (str, bytes)):
+            tags = (tags,)
+        return any(getattr(tag, "value", tag) == "write" for tag in tags)
+
+    def _get_write_tool_names(self) -> frozenset:
+        """
+        获取当前 MoviePilot 实例的写工具名称。
+
+        内置 MCP 的工具列表还会动态包含其他插件提供的 Agent 工具，固定名单无法覆盖
+        这些工具。因此优先从内置工具管理器的运行时实例读取规范化后的 tags，失败时再
+        使用当前版本的兼容兜底集合。
+        """
+        write_tool_names = set(self._write_tool_names)
+        try:
+            from app.agent.tools.manager import moviepilot_tool_manager
+
+            for tool in getattr(moviepilot_tool_manager, "tools", ()):
+                if not self._tool_has_write_tag(tool):
+                    continue
+                tool_name = getattr(tool, "name", None)
+                if isinstance(tool_name, str) and tool_name:
+                    write_tool_names.add(tool_name)
+        except Exception as err:
+            logger.debug(f"读取内置 MCP 写工具标签失败，使用兼容名单：{err}")
+        return frozenset(write_tool_names)
 
     def get_api(self) -> List[Dict[str, Any]]:
         return [
@@ -530,7 +575,7 @@ class MoviePilotMCP(_PluginBase):
                 "component": "VCard",
                 "props": {"variant": "tonal"},
                 "content": [
-                    {"component": "VCardTitle", "text": "MoviePilot MCP / OpenAPI 包装层"},
+                    {"component": "VCardTitle", "text": "MoviePilot MCP 包装层"},
                     {"component": "VCardText", "text": f"状态：{'已启用' if self._enabled else '未启用'}"},
                     {"component": "VCardText", "text": f"MCP Endpoint：{endpoint_url}"},
                     {"component": "VCardText", "text": f"OAuth Authorization：{authorize_url}"},
@@ -595,6 +640,7 @@ class MoviePilotMCP(_PluginBase):
             access_info=access_info,
             result="accepted",
         )
+        write_tool_names = self._get_write_tool_names()
 
         # 统一为列表以支持批量请求
         messages = payload if isinstance(payload, list) else [payload]
@@ -608,7 +654,7 @@ class MoviePilotMCP(_PluginBase):
             for m in messages:
                 if isinstance(m, dict) and m.get("method") == "tools/call":
                     tool_name = (m.get("params") or {}).get("name", "")
-                    if tool_name in self._write_tool_names:
+                    if tool_name in write_tool_names:
                         return JSONResponse({
                             "jsonrpc": "2.0",
                             "id": m.get("id"),
@@ -655,7 +701,7 @@ class MoviePilotMCP(_PluginBase):
         # 若关闭写工具，从 tools/list 响应里过滤写工具
         if not self._enable_write_tools and resp.status_code == 200:
             try:
-                return JSONResponse(self._filter_write_tools(resp.json()))
+                return JSONResponse(self._filter_write_tools(resp.json(), write_tool_names))
             except Exception:
                 pass  # 解析失败则原样透传
 
@@ -665,8 +711,11 @@ class MoviePilotMCP(_PluginBase):
             media_type=resp.headers.get("content-type", "application/json"),
         )
 
-    def _filter_write_tools(self, resp_data: Any) -> Any:
+    def _filter_write_tools(
+        self, resp_data: Any, write_tool_names: Optional[frozenset] = None
+    ) -> Any:
         """从 tools/list 响应中过滤掉写操作工具（仅在关闭写操作时调用）。"""
+        write_tool_names = write_tool_names or self._get_write_tool_names()
         if not isinstance(resp_data, dict):
             return resp_data
         result = resp_data.get("result")
@@ -675,7 +724,11 @@ class MoviePilotMCP(_PluginBase):
         tools = result.get("tools")
         if not isinstance(tools, list):
             return resp_data
-        result["tools"] = [t for t in tools if t.get("name") not in self._write_tool_names]
+        result["tools"] = [
+            tool
+            for tool in tools
+            if not isinstance(tool, dict) or tool.get("name") not in write_tool_names
+        ]
         return resp_data
 
     # ==================== OpenAPI REST 端点 ====================
@@ -727,7 +780,8 @@ class MoviePilotMCP(_PluginBase):
             return [], "内部 MCP 响应缺少 tools"
         # 过滤写工具
         if not self._enable_write_tools:
-            tools = [t for t in tools if t.get("name") not in self._write_tool_names]
+            write_tool_names = self._get_write_tool_names()
+            tools = [t for t in tools if t.get("name") not in write_tool_names]
         return tools, None
 
     @staticmethod
@@ -775,7 +829,7 @@ class MoviePilotMCP(_PluginBase):
         self._authorize_mcp_request(request)
 
         # 写工具拦截
-        if not self._enable_write_tools and tool_name in self._write_tool_names:
+        if not self._enable_write_tools and tool_name in self._get_write_tool_names():
             return JSONResponse(
                 {"success": False, "error": f"写操作工具 '{tool_name}' 已被禁用"},
                 status_code=403,
@@ -911,8 +965,9 @@ class MoviePilotMCP(_PluginBase):
         tools, error = await self._fetch_mcp_tools()
         if error:
             return [], [], error
-        readonly_tools = [t for t in tools if t.get("name") not in self._write_tool_names]
-        write_tools = [t for t in tools if t.get("name") in self._write_tool_names]
+        write_tool_names = self._get_write_tool_names()
+        readonly_tools = [t for t in tools if t.get("name") not in write_tool_names]
+        write_tools = [t for t in tools if t.get("name") in write_tool_names]
         return readonly_tools, write_tools, None
 
     async def handle_openapi_spec(self, request: Request):

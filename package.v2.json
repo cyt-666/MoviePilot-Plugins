@@ -1,13 +1,14 @@
 {
     "MoviePilotMCP": {
-        "name": "MoviePilot MCP / OpenAPI Server",
-        "description": "MoviePilot 内置 Agent 工具的 MCP/OpenAPI 双协议对外暴露层，支持 OAuth 2.0 + PKCE 鉴权",
-        "labels": "MCP,OpenAPI,ChatGPT,Codex,Swagger,自动化,MoviePilot",
-        "version": "0.7.2",
+        "name": "MoviePilot MCP Server",
+        "description": "MoviePilot 内置 Agent 工具的 MCP 对外暴露层，支持 OAuth 2.0 + PKCE 鉴权",
+        "labels": "MCP,OpenAPI,ChatGPT,Codex,自动化,MoviePilot",
+        "version": "0.7.3",
         "icon": "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/moviepilotmcp.svg",
         "author": "cyt-666",
         "level": 1,
         "history": {
+            "v0.7.3": "修复写操作开关使用过时工具名导致的漏拦截问题：优先按内置工具运行时 write 标签动态识别，并补充当前版本兼容名单；同步 README 的动态工具列表和 OpenAPI 当前未暴露状态。",
             "v0.7.2": "新增 MCP/OAuth 请求审计日志，安全记录 client 名称、认证方式、动作与结果且不输出 Token；将 OAuth issuer 对齐 MCP resource 并新增 /mcp/.well-known/openid-configuration 发现端点，修复 Codex OAuth 元数据发现；补充 Codex 显式登录与工具刷新说明。",
             "v0.7.1": "暂时禁用 OpenAPI 端点对外暴露（代码保留），解决 ChatGPT Actions 无法正常接入的问题。",
             "v0.7.0": "拆分 OpenAPI Spec 为只读和写操作两个独立端点：/openapi.json 仅含只读工具（推荐用于 ChatGPT Actions），/openapi.write.json 仅含写操作工具；移除截断配置，改为按工具类型分 spec 暴露。",
