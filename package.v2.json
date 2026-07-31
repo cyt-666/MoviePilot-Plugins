@@ -39,11 +39,12 @@
         "name": "Trakt WatchList 同步",
         "description": "同步 Trakt Watchlist 和自定义列表，并提供完整榜单与个人数据 MCP 查询",
         "labels": "Trakt,WatchList,自定义列表,同步,推荐,榜单,MCP",
-        "version": "0.5.1",
+        "version": "0.5.2",
         "icon": "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/trakt.png",
         "author": "cyt-666",
         "level": 2,
         "history": {
+            "v0.5.2": "补充立即同步可观测日志：记录任务入队、同步模式、来源统计、来源跳过、新增订阅、失败原因及最终汇总，且不输出账户 UUID、Token 或请求头。",
             "v0.5.1": "修复升级后旧 Watchlist 条目被重新处理的问题：迁移旧同步历史到来源状态，手动刷新不再重做已完成条目，避免重复追加已存在历史，并兼容按旧媒体 ID 识别已有订阅。",
             "v0.5.0": "新增 Watchlist 与自定义列表增量订阅同步、账户隔离缓存和详情页管理；榜单扩展 watched、collected、电影 boxoffice；以 get_trakt_lists、get_trakt_personal_data、get_trakt_custom_lists 三个 MCP 工具替换旧 get_trakt_recommendations。",
             "v0.4.6": "修复Trakt推荐接口返回500的问题：改用OAuth个性化推荐接口，支持token自动刷新，并对最多100条推荐结果进行本地分页。",

@@ -7,7 +7,7 @@ import time
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 
 def _install_module(name, **attributes):
@@ -891,6 +891,36 @@ class TraktSyncTest(unittest.TestCase):
         self.assertEqual(["watchlist:movie"], result["summary"]["skipped"])
         self.plugin._fetch_all_pages.assert_not_called()
 
+    def test_sync_logs_start_source_statistics_and_final_summary(self):
+        self.plugin._media_type = "movie"
+        self.plugin._get_account = Mock(
+            return_value=({"uuid": "account-uuid", "slug": "tester"}, {})
+        )
+        self.plugin._get_last_activities = Mock(
+            return_value={"watchlist": {"updated_at": "2026-02-01T00:00:00Z"}}
+        )
+        self.plugin._fetch_all_pages = Mock(return_value=[_movie_item()])
+        self.plugin._process_subscription_item = Mock(return_value=True)
+
+        with patch.object(self.module.logger, "info") as log_info:
+            result = self.plugin.sync_sources(force=True)
+
+        self.assertTrue(result["success"])
+        messages = [call.args[0] for call in log_info.call_args_list]
+        self.assertTrue(any("模式=手动刷新" in message for message in messages))
+        self.assertTrue(
+            any(
+                "Trakt 来源同步完成" in message
+                and "来源=watchlist:movie" in message
+                and "检查=1" in message
+                for message in messages
+            )
+        )
+        self.assertTrue(any("Trakt 同步完成" in message for message in messages))
+        serialized = "\n".join(messages)
+        self.assertNotIn("account-uuid", serialized)
+        self.assertNotIn("access-token", serialized)
+
     def test_last_activities_change_fetches_source(self):
         self.plugin._media_type = "movie"
         self.plugin._get_account = Mock(
@@ -1148,6 +1178,49 @@ class TraktSyncTest(unittest.TestCase):
         self.assertTrue(result)
         self.assertEqual(1, len(self.store.data["history"]))
         self.plugin.subscribechain.add.assert_not_called()
+
+    def test_new_subscription_logs_source_and_stable_media_key(self):
+        media = _MediaInfo(tmdb_id=101)
+        self.plugin.chain = types.SimpleNamespace(
+            recognize_media=Mock(return_value=media)
+        )
+        self.plugin.downloadchain = types.SimpleNamespace(
+            get_no_exists_info=Mock(return_value=(False, {}))
+        )
+        self.plugin.subscribechain = types.SimpleNamespace(
+            exists=Mock(return_value=False),
+            add=Mock(return_value=(123, "ok")),
+            finish_subscribe_or_not=Mock(),
+        )
+
+        with patch.object(self.module.logger, "info") as log_info:
+            result = self.plugin._process_subscription_item(
+                _movie_item(),
+                "watchlist:movie",
+                "movie:1",
+            )
+
+        self.assertTrue(result)
+        log_info.assert_called_once_with(
+            "Trakt 新增 MoviePilot 订阅：来源=watchlist:movie，"
+            "媒体=Test (2026)，标识=movie:1"
+        )
+
+    def test_sync_now_logs_queue_and_starts_background_thread(self):
+        with (
+            patch.object(self.module.logger, "info") as log_info,
+            patch.object(self.module, "Thread") as thread_class,
+        ):
+            response = self.plugin.api_sync_now()
+
+        self.assertTrue(response.success)
+        log_info.assert_called_once_with("Trakt 手动刷新同步已进入后台队列")
+        thread_class.assert_called_once_with(
+            target=self.plugin.sync_sources,
+            kwargs={"force": True},
+            daemon=True,
+        )
+        thread_class.return_value.start.assert_called_once_with()
 
     def test_legacy_subscription_identity_fallback_prevents_duplicate(self):
         media = _MediaInfo(tmdb_id=101)
@@ -1476,12 +1549,12 @@ class TraktSyncTest(unittest.TestCase):
             root / "plugins.v2" / "traktsync" / "README.md"
         ).read_text(encoding="utf-8")
 
-        self.assertEqual("0.5.1", self.module.TraktSync.plugin_version)
+        self.assertEqual("0.5.2", self.module.TraktSync.plugin_version)
         self.assertEqual(
             self.module.TraktSync.plugin_version,
             package["TraktSync"]["version"],
         )
-        self.assertIn("Trakt WatchList 同步 `v0.5.1`", readme)
+        self.assertIn("Trakt WatchList 同步 `v0.5.2`", readme)
         self.assertIn("get_trakt_lists", plugin_readme)
 
 
