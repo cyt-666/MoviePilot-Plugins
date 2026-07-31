@@ -288,7 +288,7 @@ class TraktSync(_PluginBase):
     plugin_desc = "同步 Trakt Watchlist 和自定义列表，并提供完整榜单及个人数据 MCP 查询"
     plugin_icon = "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/trakt.png"
     plugin_author = "cyt-666"
-    plugin_version = "0.5.0"
+    plugin_version = "0.5.1"
     author_url = "https://github.com/cyt-666/MoviePilot-Plugins"
     plugin_config_prefix = "traktsync_"
     plugin_order = 3
@@ -315,6 +315,7 @@ class TraktSync(_PluginBase):
     _selected_lists_key = "trakt_selected_lists_v1"
     _sync_state_key = "trakt_sync_state_v2"
     _sync_status_key = "trakt_sync_status_v1"
+    _legacy_history_migration_key = "trakt_sync_history_migration_v1"
 
     _scheduler: Optional[BackgroundScheduler] = None
     _cache_path: Optional[Path] = None
@@ -899,12 +900,12 @@ class TraktSync(_PluginBase):
             self._sync_status_key,
             {
                 "state": "queued",
-                "message": "手动完整同步已进入后台队列",
+                "message": "手动刷新同步已进入后台队列",
                 "started_at": self._now_iso(),
             },
         )
         Thread(target=self.sync_sources, kwargs={"force": True}, daemon=True).start()
-        return schemas.Response(success=True, message="已启动 Trakt 完整同步")
+        return schemas.Response(success=True, message="已启动 Trakt 强制刷新同步")
 
     def api_cache_refresh(self, request: CacheRefreshRequest):
         scope = (request.scope or "all").lower()
@@ -1537,6 +1538,14 @@ class TraktSync(_PluginBase):
                 self._clear_cached_data("personal")
                 self.del_data(self._sync_state_key)
                 self.del_data(self._selected_lists_key)
+                self.save_data(
+                    self._legacy_history_migration_key,
+                    {
+                        "account_uuid": account.get("uuid"),
+                        "completed_at": self._now_iso(),
+                        "reason": "account_switch",
+                    },
+                )
                 logger.info("检测到 Trakt 账户切换，已清理旧账户缓存和同步状态")
             record = {
                 "timestamp": time.time(),
@@ -2361,14 +2370,83 @@ class TraktSync(_PluginBase):
             return None
         return f"{item_type}:{trakt_id}"
 
+    @staticmethod
+    def _normalize_history_media_type(value: Any) -> Optional[str]:
+        normalized = str(value or "").strip().casefold()
+        if normalized in ("movie", "movies", "电影"):
+            return "movie"
+        if normalized in ("show", "shows", "tv", "电视剧", "剧集"):
+            return "show"
+        return None
+
+    @classmethod
+    def _media_signature(cls, item_type: Any, tmdb_id: Any) -> Optional[str]:
+        normalized_type = cls._normalize_history_media_type(item_type)
+        normalized_tmdb_id = str(tmdb_id or "").strip()
+        if not normalized_type or not normalized_tmdb_id:
+            return None
+        return f"{normalized_type}:tmdb:{normalized_tmdb_id}"
+
+    @staticmethod
+    def _history_source_matches(history_source: Any, source: str) -> bool:
+        if history_source:
+            history_source = str(history_source)
+            return history_source == source or (
+                history_source == "watchlist" and source.startswith("watchlist:")
+            )
+        return source.startswith("watchlist:")
+
+    def _history_signatures_for_source(self, source: str) -> set:
+        """提取旧版成功历史，用于首次建立新的来源同步状态。"""
+        signatures = set()
+        for history in (self.get_data("history") or {}).values():
+            if not isinstance(history, dict) or not self._history_source_matches(
+                history.get("source"), source
+            ):
+                continue
+            signature = self._media_signature(
+                history.get("type"), history.get("tmdbid")
+            )
+            if signature:
+                signatures.add(signature)
+        return signatures
+
+    def _history_entry_matches(
+        self,
+        history: dict,
+        source: str,
+        stable_key: str,
+        mediainfo,
+    ) -> bool:
+        source_key = f"{source}:{stable_key}"
+        if history.get("source_key") == source_key:
+            return True
+        if not self._history_source_matches(history.get("source"), source):
+            return False
+        history_signature = self._media_signature(
+            history.get("type"), history.get("tmdbid")
+        )
+        media_type = getattr(mediainfo, "type", None)
+        current_signature = self._media_signature(
+            getattr(media_type, "value", media_type),
+            getattr(mediainfo, "tmdb_id", None),
+        )
+        return bool(history_signature and history_signature == current_signature)
+
     def _record_sync_history(
         self,
         source: str,
         stable_key: str,
         mediainfo,
         action: str,
-    ):
+    ) -> bool:
         histories = self.get_data("history") or {}
+        if action == "exist" and any(
+            self._history_entry_matches(history, source, stable_key, mediainfo)
+            for history in histories.values()
+            if isinstance(history, dict)
+        ):
+            return False
         media_type = getattr(mediainfo, "type", None)
         media_type_value = getattr(media_type, "value", str(media_type or ""))
         history_id = f"{source}:{stable_key}:{time.time_ns()}"
@@ -2387,9 +2465,31 @@ class TraktSync(_PluginBase):
             "tmdbid": getattr(mediainfo, "tmdb_id", None),
             "action": action,
             "source": source,
+            "source_key": f"{source}:{stable_key}",
             "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
         self.save_data("history", histories)
+        return True
+
+    def _subscription_exists(self, mediainfo, meta) -> bool:
+        if self.subscribechain.exists(mediainfo=mediainfo, meta=meta):
+            return True
+        season = getattr(meta, "begin_season", None)
+        legacy_id_fields = (
+            ("tmdbid", "tmdb_id"),
+            ("doubanid", "douban_id"),
+            ("bangumiid", "bangumi_id"),
+            ("anilistid", "anilist_id"),
+        )
+        for query_field, media_field in legacy_id_fields:
+            media_id = getattr(mediainfo, media_field, None)
+            if media_id in (None, ""):
+                continue
+            if SubscribeOper().exists(
+                **{query_field: media_id, "season": season}
+            ):
+                return True
+        return False
 
     def _process_subscription_item(
         self,
@@ -2418,7 +2518,7 @@ class TraktSync(_PluginBase):
                 meta=meta,
                 mediainfo=mediainfo,
             )
-            if library_exists or self.subscribechain.exists(mediainfo=mediainfo, meta=meta):
+            if library_exists or self._subscription_exists(mediainfo, meta):
                 action = "exist"
             else:
                 sub_id, message = self.add_subscribe_season(
@@ -2454,19 +2554,33 @@ class TraktSync(_PluginBase):
         previous_state: Optional[dict],
         activity_at: Optional[str],
         force: bool,
+        bootstrap_signatures: Optional[set] = None,
     ) -> Tuple[dict, dict]:
         previous_state = previous_state or {}
         current = {}
+        current_signatures = {}
         for raw_item in raw_items:
             normalized = self._normalize_item(raw_item)
             stable_key = self._stable_media_key(normalized)
             if stable_key:
                 current[stable_key] = raw_item
+                signature = self._media_signature(
+                    normalized.get("type"), normalized.get("tmdb_id")
+                )
+                if signature:
+                    current_signatures[stable_key] = signature
 
-        previous_processed = set(previous_state.get("processed") or [])
+        original_processed = set(previous_state.get("processed") or [])
+        migrated = {
+            stable_key
+            for stable_key, signature in current_signatures.items()
+            if signature in (bootstrap_signatures or set())
+        }.difference(original_processed)
+        previous_processed = original_processed.union(migrated)
         current_keys = set(current)
         retained = previous_processed.intersection(current_keys)
-        candidates = current_keys if force else current_keys.difference(retained)
+        # force 只强制刷新远程来源；已成功处理的条目仍保持幂等。
+        candidates = current_keys.difference(retained)
         succeeded = set()
         failed = set()
         for stable_key in sorted(candidates):
@@ -2487,6 +2601,7 @@ class TraktSync(_PluginBase):
                 "succeeded": len(succeeded),
                 "failed": len(failed),
                 "removed": len(previous_processed.difference(current_keys)),
+                "migrated": len(migrated),
             },
         }
         return state, state["last_result"]
@@ -2511,6 +2626,7 @@ class TraktSync(_PluginBase):
         activities: Optional[dict],
         force: bool,
         summary: dict,
+        bootstrap_legacy: bool = False,
     ):
         activity_at = self._activity_value(activities, "watchlist")
         activities_available = activities is not None
@@ -2537,6 +2653,11 @@ class TraktSync(_PluginBase):
                     previous_state=previous,
                     activity_at=activity_at,
                     force=force,
+                    bootstrap_signatures=(
+                        self._history_signatures_for_source(source)
+                        if bootstrap_legacy and not (previous or {}).get("processed")
+                        else None
+                    ),
                 )
                 state["sources"][source] = source_state
                 summary["sources"][source] = result
@@ -2559,6 +2680,7 @@ class TraktSync(_PluginBase):
         force: bool,
         only_list_id: Optional[int],
         summary: dict,
+        bootstrap_legacy: bool = False,
     ):
         selected_ids = set(self._selected_list_ids())
         if only_list_id is not None:
@@ -2641,6 +2763,11 @@ class TraktSync(_PluginBase):
                     previous_state=previous,
                     activity_at=activity_at,
                     force=force,
+                    bootstrap_signatures=(
+                        self._history_signatures_for_source(source)
+                        if bootstrap_legacy and not (previous or {}).get("processed")
+                        else None
+                    ),
                 )
                 state["sources"][source] = source_state
                 summary["sources"][source] = result
@@ -2703,6 +2830,8 @@ class TraktSync(_PluginBase):
             if state.get("account_uuid") != account_uuid:
                 state = {"account_uuid": account_uuid, "sources": {}}
             state.setdefault("sources", {})
+            migration = self.get_data(self._legacy_history_migration_key) or {}
+            bootstrap_legacy = migration.get("account_uuid") != account_uuid
 
             if only_list_id is None:
                 self._sync_watchlist_sources(
@@ -2710,6 +2839,7 @@ class TraktSync(_PluginBase):
                     activities=activities,
                     force=force,
                     summary=summary,
+                    bootstrap_legacy=bootstrap_legacy,
                 )
             self._sync_custom_list_sources(
                 state=state,
@@ -2717,11 +2847,32 @@ class TraktSync(_PluginBase):
                 force=force,
                 only_list_id=only_list_id,
                 summary=summary,
+                bootstrap_legacy=bootstrap_legacy,
             )
             if activities is not None and not summary["failed_sources"]:
                 state["last_activities"] = activities
             state["updated_at"] = self._now_iso()
             self.save_data(self._sync_state_key, state)
+
+            expected_watchlist_sources = {
+                f"watchlist:{media_type}"
+                for media_type in self._watchlist_sync_types()
+            }
+            if (
+                bootstrap_legacy
+                and only_list_id is None
+                and not expected_watchlist_sources.intersection(
+                    summary["failed_sources"]
+                )
+            ):
+                self.save_data(
+                    self._legacy_history_migration_key,
+                    {
+                        "account_uuid": account_uuid,
+                        "completed_at": self._now_iso(),
+                        "reason": "legacy_history_bootstrap",
+                    },
+                )
 
             success = not summary["failed_sources"]
             checked = sum(
@@ -2732,8 +2883,13 @@ class TraktSync(_PluginBase):
                 int(result.get("failed") or 0)
                 for result in summary["sources"].values()
             )
+            migrated = sum(
+                int(result.get("migrated") or 0)
+                for result in summary["sources"].values()
+            )
+            summary["migrated"] = migrated
             message = (
-                f"同步完成：检查 {checked} 项，失败 {failed} 项，"
+                f"同步完成：迁移 {migrated} 项，检查 {checked} 项，失败 {failed} 项，"
                 f"跳过 {len(summary['skipped'])} 个未变化来源"
             )
             self.save_data(

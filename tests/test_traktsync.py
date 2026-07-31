@@ -89,9 +89,15 @@ class _MetaInfo:
 
 class _SubscribeOper:
     subscriptions = {}
+    exists_result = False
+    exists_calls = []
 
     def get(self, sub_id):
         return self.subscriptions.get(sub_id)
+
+    def exists(self, **kwargs):
+        self.exists_calls.append(kwargs)
+        return self.exists_result
 
 
 def _load_plugin_module_with_stubs():
@@ -253,6 +259,8 @@ class TraktSyncTest(unittest.TestCase):
         self.plugin._client_secret = "client-secret"
         self.store = _Store().attach(self.plugin)
         self.plugin.token = {}
+        _SubscribeOper.exists_result = False
+        _SubscribeOper.exists_calls.clear()
 
     def test_all_chart_endpoints_and_period(self):
         cases = {
@@ -912,6 +920,65 @@ class TraktSyncTest(unittest.TestCase):
         self.assertEqual("2026-02-01T00:00:00Z", state["activity_at"])
         self.assertEqual(["movie:1"], state["processed"])
 
+    def test_legacy_history_bootstraps_source_state_without_reprocessing(self):
+        self.plugin._media_type = "movie"
+        self.plugin._get_account = Mock(
+            return_value=({"uuid": "account-uuid", "slug": "tester"}, {})
+        )
+        self.plugin._get_last_activities = Mock(
+            return_value={"watchlist": {"updated_at": "2026-02-01T00:00:00Z"}}
+        )
+        self.plugin._fetch_all_pages = Mock(return_value=[_movie_item()])
+        self.plugin._process_subscription_item = Mock(return_value=True)
+        self.store.data["history"] = {
+            "legacy-list-item-id": {
+                "title": "Movie (2026)",
+                "type": "movie",
+                "tmdbid": 101,
+                "action": "subscribe",
+            }
+        }
+
+        result = self.plugin.sync_sources()
+
+        self.assertTrue(result["success"])
+        self.assertEqual(1, result["summary"]["migrated"])
+        self.plugin._process_subscription_item.assert_not_called()
+        source_state = self.store.data[self.plugin._sync_state_key]["sources"][
+            "watchlist:movie"
+        ]
+        self.assertEqual(["movie:1"], source_state["processed"])
+        self.assertEqual(
+            "account-uuid",
+            self.store.data[self.plugin._legacy_history_migration_key][
+                "account_uuid"
+            ],
+        )
+
+    def test_force_refresh_does_not_reprocess_completed_items(self):
+        previous = {
+            "activity_at": "old",
+            "processed": ["movie:1"],
+            "pending": [],
+        }
+        self.plugin._process_subscription_item = Mock(return_value=True)
+
+        state, result = self.plugin._sync_subscription_source(
+            source="watchlist:movie",
+            raw_items=[_movie_item(), _movie_item(trakt_id=2, tmdb_id=102)],
+            previous_state=previous,
+            activity_at="new",
+            force=True,
+        )
+
+        self.assertEqual(["movie:1", "movie:2"], state["processed"])
+        self.assertEqual(1, result["checked"])
+        self.plugin._process_subscription_item.assert_called_once()
+        self.assertEqual(
+            "movie:2",
+            self.plugin._process_subscription_item.call_args.args[2],
+        )
+
     def test_last_activities_failure_falls_back_to_full_sync(self):
         self.plugin._media_type = "movie"
         self.plugin._get_account = Mock(
@@ -1049,6 +1116,66 @@ class TraktSyncTest(unittest.TestCase):
         self.assertEqual([], state["processed"])
         self.assertEqual(0, result["checked"])
         self.plugin._process_subscription_item.assert_not_called()
+
+    def test_existing_item_does_not_append_duplicate_history(self):
+        media = _MediaInfo(tmdb_id=101)
+        self.plugin.chain = types.SimpleNamespace(
+            recognize_media=Mock(return_value=media)
+        )
+        self.plugin.downloadchain = types.SimpleNamespace(
+            get_no_exists_info=Mock(return_value=(False, {}))
+        )
+        self.plugin.subscribechain = types.SimpleNamespace(
+            exists=Mock(return_value=True),
+            add=Mock(),
+            finish_subscribe_or_not=Mock(),
+        )
+        self.store.data["history"] = {
+            "legacy-list-item-id": {
+                "title": "Movie (2026)",
+                "type": "movie",
+                "tmdbid": 101,
+                "action": "subscribe",
+            }
+        }
+
+        result = self.plugin._process_subscription_item(
+            _movie_item(),
+            "watchlist:movie",
+            "movie:1",
+        )
+
+        self.assertTrue(result)
+        self.assertEqual(1, len(self.store.data["history"]))
+        self.plugin.subscribechain.add.assert_not_called()
+
+    def test_legacy_subscription_identity_fallback_prevents_duplicate(self):
+        media = _MediaInfo(tmdb_id=101)
+        self.plugin.chain = types.SimpleNamespace(
+            recognize_media=Mock(return_value=media)
+        )
+        self.plugin.downloadchain = types.SimpleNamespace(
+            get_no_exists_info=Mock(return_value=(False, {}))
+        )
+        self.plugin.subscribechain = types.SimpleNamespace(
+            exists=Mock(return_value=False),
+            add=Mock(),
+            finish_subscribe_or_not=Mock(),
+        )
+        _SubscribeOper.exists_result = True
+
+        result = self.plugin._process_subscription_item(
+            _movie_item(),
+            "watchlist:movie",
+            "movie:1",
+        )
+
+        self.assertTrue(result)
+        self.plugin.subscribechain.add.assert_not_called()
+        self.assertEqual(
+            {"tmdbid": 101, "season": None},
+            _SubscribeOper.exists_calls[0],
+        )
 
     def test_cross_source_duplicate_adds_only_one_moviepilot_subscription(self):
         media = _MediaInfo(tmdb_id=101)
@@ -1349,12 +1476,12 @@ class TraktSyncTest(unittest.TestCase):
             root / "plugins.v2" / "traktsync" / "README.md"
         ).read_text(encoding="utf-8")
 
-        self.assertEqual("0.5.0", self.module.TraktSync.plugin_version)
+        self.assertEqual("0.5.1", self.module.TraktSync.plugin_version)
         self.assertEqual(
             self.module.TraktSync.plugin_version,
             package["TraktSync"]["version"],
         )
-        self.assertIn("Trakt WatchList 同步 `v0.5.0`", readme)
+        self.assertIn("Trakt WatchList 同步 `v0.5.1`", readme)
         self.assertIn("get_trakt_lists", plugin_readme)
 
 
