@@ -37,13 +37,15 @@
     },
     "TraktSync": {
         "name": "Trakt WatchList 同步",
-        "description": "Trakt WatchList 同步，提供Trakt榜单推荐数据",
-        "labels": "Trakt,WatchList,同步,推荐,热门,趋势",
-        "version": "0.4.5",
+        "description": "同步 Trakt Watchlist 和自定义列表，并提供完整榜单与个人数据 MCP 查询",
+        "labels": "Trakt,WatchList,自定义列表,同步,推荐,榜单,MCP",
+        "version": "0.5.0",
         "icon": "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/trakt.png",
         "author": "cyt-666",
         "level": 2,
         "history": {
+            "v0.5.0": "新增 Watchlist 与自定义列表增量订阅同步、账户隔离缓存和详情页管理；榜单扩展 watched、collected、电影 boxoffice；以 get_trakt_lists、get_trakt_personal_data、get_trakt_custom_lists 三个 MCP 工具替换旧 get_trakt_recommendations。",
+            "v0.4.6": "修复Trakt推荐接口返回500的问题：改用OAuth个性化推荐接口，支持token自动刷新，并对最多100条推荐结果进行本地分页。",
             "v0.4.5": "修复Trakt API请求未走MoviePilot代理配置的问题，所有HTTP请求改为使用settings.PROXY。",
             "v0.4.4": "简化筛选器为单层芯片组，用分组标签区分电影和剧集榜单，避免切换媒体类型时榜单重置问题。",
             "v0.4.3": "探索页面Trakt筛选器增加媒体类型层级，先选电影/剧集再选榜单类型。",

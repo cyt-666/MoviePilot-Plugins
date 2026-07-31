@@ -15,22 +15,25 @@ MoviePilot插件市场：https://github.com/cyt-666/MoviePilot-Plugins
 
 ---
 
-### Trakt WatchList 同步 `v0.4.4`
+### Trakt WatchList 同步 `v0.5.0`
 
-Trakt 观看列表同步与榜单浏览插件。
+Trakt 观看列表、自定义列表订阅同步与完整榜单浏览插件。
 
-- **WatchList 同步**：将 Trakt watchlist 自动同步为 MoviePilot 订阅，支持电影和剧集
-- **榜单探索**：在探索页面浏览 Trakt 热门、趋势、推荐、待映榜单，支持无限滚动分页
-- **MCP 工具**：提供 `get_trakt_recommendations` 工具供智能体调用
-- 榜单数据通过 Trakt 公开 API 获取，缓存 6 小时
+- **增量订阅同步**：使用 Trakt `last_activities` 仅同步发生变化的 Watchlist 和已选自定义列表；移除来源条目不会删除 MoviePilot 订阅
+- **完整榜单探索**：热门、趋势、待映、观看、收藏、推荐，以及电影周末票房
+- **MCP 查询**：`get_trakt_lists`、管理员工具 `get_trakt_personal_data` 和 `get_trakt_custom_lists`
+- **账户隔离缓存**：公开榜单缓存 6 小时，推荐、个人数据和列表条目缓存 15 分钟，自定义列表目录缓存 1 小时；实时失败可回退陈旧缓存
+- **详情页管理**：查看账户和同步状态，立即同步、刷新缓存、刷新并选择自定义列表订阅源
 
 #### 使用方法
 
 1. 在 [Trakt 网站](https://trakt.tv/settings/applications) 注册应用，redirect_url 填写 `urn:ietf:wg:oauth:2.0:oob`
 2. 获取 Client ID 和 Client Secret
 3. 在插件配置中填写 Client ID 和 Client Secret，保存
-4. 查看插件日志中的认证链接和认证码，完成 Trakt 账户绑定
-5. 在插件配置中启用所需的榜单类型，即可在探索页面的 Trakt Tab 中浏览
+4. 在插件详情页查看设备授权地址和代码，完成单一管理员 Trakt 账户绑定
+5. 在插件配置中启用所需探索榜单；在详情页刷新并选择需要同步的自定义列表
+
+详细能力、缓存和同步语义见 [plugins.v2/traktsync/README.md](plugins.v2/traktsync/README.md)。
 
 ---
 
