@@ -288,7 +288,7 @@ class TraktSync(_PluginBase):
     plugin_desc = "同步 Trakt Watchlist 和自定义列表，并提供完整榜单及个人数据 MCP 查询"
     plugin_icon = "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/trakt.png"
     plugin_author = "cyt-666"
-    plugin_version = "0.5.1"
+    plugin_version = "0.5.2"
     author_url = "https://github.com/cyt-666/MoviePilot-Plugins"
     plugin_config_prefix = "traktsync_"
     plugin_order = 3
@@ -895,6 +895,7 @@ class TraktSync(_PluginBase):
 
     def api_sync_now(self):
         if _sync_lock.locked():
+            logger.warning("Trakt 手动刷新同步未启动：已有同步任务正在运行")
             return schemas.Response(success=False, message="Trakt 同步任务正在运行")
         self.save_data(
             self._sync_status_key,
@@ -904,6 +905,7 @@ class TraktSync(_PluginBase):
                 "started_at": self._now_iso(),
             },
         )
+        logger.info("Trakt 手动刷新同步已进入后台队列")
         Thread(target=self.sync_sources, kwargs={"force": True}, daemon=True).start()
         return schemas.Response(success=True, message="已启动 Trakt 强制刷新同步")
 
@@ -2540,6 +2542,15 @@ class TraktSync(_PluginBase):
                         lefts=no_exists,
                     )
                 action = "subscribe"
+                media_title = (
+                    getattr(mediainfo, "title_year", None)
+                    or getattr(mediainfo, "title", None)
+                    or stable_key
+                )
+                logger.info(
+                    f"Trakt 新增 MoviePilot 订阅：来源={source}，"
+                    f"媒体={media_title}，标识={stable_key}"
+                )
             self._record_sync_history(source, stable_key, mediainfo, action)
             return True
         except Exception as exc:
@@ -2607,6 +2618,18 @@ class TraktSync(_PluginBase):
         return state, state["last_result"]
 
     @staticmethod
+    def _log_source_result(source: str, result: dict):
+        logger.info(
+            "Trakt 来源同步完成："
+            f"来源={source}，当前={int(result.get('current') or 0)}，"
+            f"迁移={int(result.get('migrated') or 0)}，"
+            f"检查={int(result.get('checked') or 0)}，"
+            f"成功={int(result.get('succeeded') or 0)}，"
+            f"失败={int(result.get('failed') or 0)}，"
+            f"移除={int(result.get('removed') or 0)}"
+        )
+
+    @staticmethod
     def _source_can_skip(
         source_state: Optional[dict],
         activity_at: Optional[str],
@@ -2640,6 +2663,7 @@ class TraktSync(_PluginBase):
                 force,
             ):
                 summary["skipped"].append(source)
+                logger.info(f"Trakt 来源未变化，跳过同步：来源={source}")
                 continue
             try:
                 raw_items = self._fetch_all_pages(
@@ -2661,15 +2685,20 @@ class TraktSync(_PluginBase):
                 )
                 state["sources"][source] = source_state
                 summary["sources"][source] = result
+                self._log_source_result(source, result)
                 if result.get("failed"):
                     summary["failed_sources"].append(source)
             except TraktRequestError as exc:
+                error_message = self._safe_error(str(exc))
                 failed_state = dict(previous or {})
                 failed_state["fetch_failed"] = True
                 state["sources"][source] = failed_state
                 summary["failed_sources"].append(source)
                 summary["errors"].append(
-                    {"source": source, "message": self._safe_error(str(exc))}
+                    {"source": source, "message": error_message}
+                )
+                logger.error(
+                    f"Trakt 来源拉取失败：来源={source}，错误={error_message}"
                 )
 
     def _sync_custom_list_sources(
@@ -2718,11 +2747,15 @@ class TraktSync(_PluginBase):
                     if item.get("list_id") is not None
                 }
             except TraktRequestError as exc:
+                error_message = self._safe_error(str(exc))
                 summary["errors"].append(
                     {
                         "source": "custom_lists:catalog",
-                        "message": self._safe_error(str(exc)),
+                        "message": error_message,
                     }
+                )
+                logger.warning(
+                    f"Trakt 自定义列表目录刷新失败：错误={error_message}"
                 )
 
         account = (self.get_data(self._account_key) or {}).get("data") or {}
@@ -2732,6 +2765,7 @@ class TraktSync(_PluginBase):
             summary["errors"].append(
                 {"source": "custom_lists", "message": "Trakt 账户缺少 slug"}
             )
+            logger.error("Trakt 自定义列表同步失败：账户缺少 slug")
             return
 
         for list_id in sorted(selected_ids):
@@ -2746,6 +2780,7 @@ class TraktSync(_PluginBase):
                 force,
             ):
                 summary["skipped"].append(source)
+                logger.info(f"Trakt 来源未变化，跳过同步：来源={source}")
                 continue
             try:
                 raw_items = self._fetch_all_pages(
@@ -2771,15 +2806,20 @@ class TraktSync(_PluginBase):
                 )
                 state["sources"][source] = source_state
                 summary["sources"][source] = result
+                self._log_source_result(source, result)
                 if result.get("failed"):
                     summary["failed_sources"].append(source)
             except TraktRequestError as exc:
+                error_message = self._safe_error(str(exc))
                 failed_state = dict(previous or {})
                 failed_state["fetch_failed"] = True
                 state["sources"][source] = failed_state
                 summary["failed_sources"].append(source)
                 summary["errors"].append(
-                    {"source": source, "message": self._safe_error(str(exc))}
+                    {"source": source, "message": error_message}
+                )
+                logger.error(
+                    f"Trakt 来源拉取失败：来源={source}，错误={error_message}"
                 )
 
         if not summary["errors"] or all(
@@ -2795,8 +2835,16 @@ class TraktSync(_PluginBase):
     ) -> Dict[str, Any]:
         """增量同步 Watchlist 和已选自定义列表。"""
         if not _sync_lock.acquire(blocking=False):
+            logger.warning("Trakt 同步请求已跳过：已有同步任务正在运行")
             return {"success": False, "message": "Trakt 同步任务正在运行"}
         started_at = self._now_iso()
+        mode = "手动刷新" if force else "定时增量"
+        scope = (
+            f"custom_list:{int(only_list_id)}"
+            if only_list_id is not None
+            else "watchlist_and_selected_lists"
+        )
+        logger.info(f"Trakt 同步开始：模式={mode}，范围={scope}")
         summary = {
             "sources": {},
             "skipped": [],
@@ -2824,7 +2872,7 @@ class TraktSync(_PluginBase):
                         "message": self._safe_error(str(exc)),
                     }
                 )
-                logger.warning("Trakt last_activities 获取失败，本次退回完整同步")
+                logger.warning("Trakt last_activities 获取失败，本次退回完整来源刷新")
 
             state = self.get_data(self._sync_state_key) or {}
             if state.get("account_uuid") != account_uuid:
@@ -2902,6 +2950,10 @@ class TraktSync(_PluginBase):
                     "summary": summary,
                 },
             )
+            if success:
+                logger.info(f"Trakt {message}")
+            else:
+                logger.warning(f"Trakt {message}")
             return {"success": success, "message": message, "summary": summary}
         except TraktRequestError as exc:
             message = self._safe_error(str(exc))
