@@ -289,7 +289,7 @@ def _calendar_show_item(
             "network": "Network",
             "overview": "Show overview",
             "runtime": 45,
-            "images": {"poster": ["poster.jpg"]},
+            "images": {"poster": ["media.trakt.tv/show-poster.webp"]},
             "ids": {"trakt": show_trakt_id, "tmdb": show_tmdb_id},
         },
         "episode": {
@@ -314,7 +314,7 @@ def _calendar_movie_item(
             "year": 2026,
             "overview": "Movie overview",
             "runtime": 120,
-            "images": {"poster": ["movie-poster.jpg"]},
+            "images": {"poster": ["//media.trakt.tv/movie-poster.webp"]},
             "ids": {"trakt": trakt_id, "tmdb": tmdb_id, "imdb": "tt303"},
         },
     }
@@ -538,10 +538,34 @@ class TraktSyncTest(unittest.TestCase):
         self.assertEqual(list(range(11, 21)), [item["trakt_id"] for item in payload["data"]])
         self.assertEqual(25, payload["meta"]["pagination"]["item_count"])
         self.assertTrue(payload["meta"]["pagination"]["has_more"])
-        self.assertEqual("movie-poster.jpg", payload["data"][0]["poster"])
+        self.assertEqual(
+            "https://media.trakt.tv/movie-poster.webp",
+            payload["data"][0]["poster"],
+        )
         params = self.plugin._cached_request.call_args.kwargs["params"]
         self.assertNotIn("page", params)
         self.assertNotIn("limit", params)
+
+    def test_calendar_normalizes_image_urls_and_rejects_unsafe_schemes(self):
+        cases = {
+            "media.trakt.tv/poster.webp": "https://media.trakt.tv/poster.webp",
+            "//media.trakt.tv/poster.webp": "https://media.trakt.tv/poster.webp",
+            "https://media.trakt.tv/poster.webp": "https://media.trakt.tv/poster.webp",
+            "/api/v1/image/cache/poster": "/api/v1/image/cache/poster",
+            "javascript:alert(1)": None,
+            "  ": None,
+        }
+        for source, expected in cases.items():
+            with self.subTest(source=source):
+                self.assertEqual(expected, self.plugin._normalize_image_url(source))
+
+        cached_item = self.plugin._calendar_item_with_normalized_poster(
+            {"poster": "media.trakt.tv/cached-poster.webp"}
+        )
+        self.assertEqual(
+            "https://media.trakt.tv/cached-poster.webp",
+            cached_item["poster"],
+        )
 
     def test_calendar_parameter_validation_and_default_date(self):
         self.plugin._calendar_today = Mock(return_value="2026-08-01")
@@ -2254,6 +2278,7 @@ class TraktSyncTest(unittest.TestCase):
         self.assertIn("个人剧集日历", serialized)
         self.assertIn("S01E01", serialized)
         self.assertIn("已订阅", serialized)
+        self.assertIn("https://media.trakt.tv/show-poster.webp", serialized)
         self.assertNotIn("do-not-expose", serialized)
         self.assertNotIn("access_token", serialized)
 
@@ -2293,12 +2318,12 @@ class TraktSyncTest(unittest.TestCase):
             root / "plugins.v2" / "traktsync" / "README.md"
         ).read_text(encoding="utf-8")
 
-        self.assertEqual("0.6.0", self.module.TraktSync.plugin_version)
+        self.assertEqual("0.6.1", self.module.TraktSync.plugin_version)
         self.assertEqual(
             self.module.TraktSync.plugin_version,
             package["TraktSync"]["version"],
         )
-        self.assertIn("Trakt WatchList 同步 `v0.6.0`", readme)
+        self.assertIn("Trakt WatchList 同步 `v0.6.1`", readme)
         self.assertIn("get_trakt_lists", plugin_readme)
         self.assertIn("get_trakt_calendar", plugin_readme)
 
