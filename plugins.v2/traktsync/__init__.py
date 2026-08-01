@@ -1,10 +1,13 @@
 import datetime
 import hashlib
 import json
+import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from threading import Lock, Thread
 from typing import Any, Dict, List, Optional, Tuple, Type
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pytz
 import requests
@@ -20,6 +23,7 @@ from app.chain.subscribe import SubscribeChain
 from app.core.config import settings
 from app.core.event import Event, eventmanager
 from app.core.metainfo import MetaInfo
+from app.db.downloadhistory_oper import DownloadHistoryOper
 from app.db.subscribe_oper import SubscribeOper
 from app.log import logger
 from app.plugins import _PluginBase
@@ -29,6 +33,7 @@ from app.schemas.types import ChainEventType, MediaType
 
 _token_refresh_lock = Lock()
 _sync_lock = Lock()
+_calendar_refresh_lock = Lock()
 
 
 class TraktRequestError(RuntimeError):
@@ -101,6 +106,31 @@ class GetTraktCustomListsInput(BaseModel):
     page: int = Field(1, ge=1, description="Page number, starting at 1")
     limit: int = Field(20, ge=1, le=100, description="Items per page, from 1 to 100")
     force_refresh: bool = Field(False, description="Ignore a fresh cache entry and request Trakt now")
+
+
+class GetTraktCalendarInput(BaseModel):
+    """Trakt 日历查询参数。"""
+
+    explanation: Optional[str] = Field(
+        None,
+        description="Clear explanation of why this tool is being used in the current context",
+    )
+    target: str = Field("my", description="Allowed values: my, all")
+    calendar_type: str = Field(
+        "shows",
+        description=(
+            "Allowed values: shows, movies, new_shows, season_premieres, "
+            "finales, dvd"
+        ),
+    )
+    start_date: Optional[str] = Field(
+        None,
+        description="Calendar start date in YYYY-MM-DD format; defaults to today",
+    )
+    days: int = Field(14, ge=1, le=33, description="Number of days, from 1 to 33")
+    page: int = Field(1, ge=1, description="Local page number, starting at 1")
+    limit: int = Field(20, ge=1, le=100, description="Items per page, from 1 to 100")
+    force_refresh: bool = Field(False, description="Ignore fresh calendar caches and request Trakt now")
 
 
 class CacheRefreshRequest(BaseModel):
@@ -283,12 +313,65 @@ class GetTraktCustomListsTool(MoviePilotTool):
         return _json_output(payload)
 
 
+class GetTraktCalendarTool(MoviePilotTool):
+    """查询 Trakt 播出和发行日历。"""
+
+    name: str = "get_trakt_calendar"
+    description: str = (
+        "Get Trakt personal or public calendars for shows, movies, new shows, "
+        "season premieres, finales, and DVD releases. Personal calendars require "
+        "an administrator and the configured Trakt OAuth account. Read-only."
+    )
+    args_schema: Type[BaseModel] = GetTraktCalendarInput
+    _plugin: Any = None
+
+    def __init__(self, session_id: str, user_id: str, plugin_instance=None):
+        super().__init__(session_id=session_id, user_id=user_id)
+        self._plugin = plugin_instance
+
+    def get_tool_message(self, **kwargs) -> Optional[str]:
+        target = kwargs.get("target", "my")
+        calendar_type = kwargs.get("calendar_type", "shows")
+        return f"查询 Trakt {target} {calendar_type} 日历"
+
+    async def run(
+        self,
+        target: str = "my",
+        calendar_type: str = "shows",
+        start_date: Optional[str] = None,
+        days: int = 14,
+        page: int = 1,
+        limit: int = 20,
+        force_refresh: bool = False,
+        **kwargs,
+    ) -> str:
+        if not self._plugin:
+            return _tool_failure("plugin_unavailable", "TraktSync 插件实例未初始化")
+        if (target or "").lower() == "my" and not await self.is_admin_user():
+            return _tool_failure("admin_required", "Trakt 个人日历仅允许管理员查询")
+        try:
+            payload = await self.run_blocking(
+                "plugin",
+                self._plugin.get_trakt_calendar,
+                target,
+                calendar_type,
+                start_date,
+                days,
+                page,
+                limit,
+                force_refresh,
+            )
+        except Exception:
+            return _tool_failure("query_failed", "Trakt 日历查询失败")
+        return _json_output(payload)
+
+
 class TraktSync(_PluginBase):
     plugin_name = "Trakt Watchlist Sync"
-    plugin_desc = "同步 Trakt Watchlist 和自定义列表，并提供完整榜单及个人数据 MCP 查询"
+    plugin_desc = "同步 Trakt Watchlist 和自定义列表，并提供榜单、个人数据及日历 MCP 查询"
     plugin_icon = "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/trakt.png"
     plugin_author = "cyt-666"
-    plugin_version = "0.5.2"
+    plugin_version = "0.6.0"
     author_url = "https://github.com/cyt-666/MoviePilot-Plugins"
     plugin_config_prefix = "traktsync_"
     plugin_order = 3
@@ -302,6 +385,7 @@ class TraktSync(_PluginBase):
     _request_timeout = (10, 30)
     _public_cache_ttl = 6 * 3600
     _personal_cache_ttl = 15 * 60
+    _calendar_cache_ttl = 15 * 60
     _custom_list_catalog_ttl = 3600
     _account_ttl = 3600
     _trakt_page_size = 20
@@ -316,6 +400,33 @@ class TraktSync(_PluginBase):
     _sync_state_key = "trakt_sync_state_v2"
     _sync_status_key = "trakt_sync_status_v1"
     _legacy_history_migration_key = "trakt_sync_history_migration_v1"
+    _calendar_snapshot_prefix = "trakt_calendar_snapshot_v1_"
+    _calendar_page_prefix = "trakt_calendar_page_v1_"
+    _calendar_status_prefix = "trakt_calendar_status_v1_"
+
+    _calendar_show_types = {
+        "shows",
+        "new_shows",
+        "season_premieres",
+        "finales",
+    }
+    _calendar_paths = {
+        "shows": "shows",
+        "movies": "movies",
+        "new_shows": "shows/new",
+        "season_premieres": "shows/premieres",
+        "finales": "shows/finales",
+        "dvd": "dvd",
+    }
+    _calendar_state_labels = {
+        "in_library": "已入库",
+        "downloading": "下载中",
+        "pending_library": "待入库",
+        "unaired": "未播出",
+        "subscribed": "已订阅",
+        "missing": "缺失",
+        "unknown": "状态未知",
+    }
 
     _scheduler: Optional[BackgroundScheduler] = None
     _cache_path: Optional[Path] = None
@@ -426,6 +537,27 @@ class TraktSync(_PluginBase):
                 self._onlyonce = False
                 self.__update_config()
 
+        self._start_calendar_prefetch_if_needed()
+
+    def _start_calendar_prefetch_if_needed(self):
+        """启用且已有 OAuth 时，在缺少页面快照的情况下预取一次。"""
+        if not self._enabled or not self.token:
+            return
+        account = (self.get_data(self._account_key) or {}).get("data") or {}
+        if self.get_data(self._calendar_page_data_key(account.get("uuid"))) is not None:
+            return
+        if not _calendar_refresh_lock.acquire(blocking=False):
+            return
+        try:
+            Thread(
+                target=self.refresh_calendar_page,
+                kwargs={"force_refresh": False, "lock_acquired": True},
+                daemon=True,
+            ).start()
+        except Exception:
+            _calendar_refresh_lock.release()
+            raise
+
     def _threaded_token_request(self, device_code: str, interval: int, count: int):
         """轮询设备授权结果，不在日志中输出授权码或凭证。"""
         if not device_code:
@@ -440,6 +572,7 @@ class TraktSync(_PluginBase):
                 except TraktRequestError:
                     logger.warning("Trakt OAuth 已授权，但账户资料暂未刷新")
                 logger.info("Trakt OAuth 授权成功")
+                self._start_calendar_prefetch_if_needed()
                 return
         logger.error("Trakt OAuth 授权超时")
 
@@ -625,6 +758,198 @@ class TraktSync(_PluginBase):
             },
         }
 
+    def _calendar_page_card(
+        self,
+        account_uuid: Optional[str],
+        account_connected: bool,
+    ) -> dict:
+        """使用本地快照构建个人剧集日历卡片。"""
+        page_record = self.get_data(self._calendar_page_data_key(account_uuid)) or {}
+        refresh_status = self.get_data(
+            self._calendar_status_data_key(account_uuid)
+        ) or {}
+        items = page_record.get("data") or []
+        start_date = page_record.get("start_date")
+        days = int(page_record.get("days") or 14)
+        fetched_at = page_record.get("fetched_at") or "-"
+        status_state = refresh_status.get("state") or "never"
+        status_message = refresh_status.get("message") or "尚未刷新"
+        status_time = (
+            refresh_status.get("finished_at")
+            or refresh_status.get("started_at")
+            or "-"
+        )
+
+        if start_date:
+            try:
+                start = datetime.date.fromisoformat(start_date)
+                end = start + datetime.timedelta(days=max(days - 1, 0))
+                range_text = f"{start.strftime('%m-%d')} - {end.strftime('%m-%d')}"
+            except ValueError:
+                range_text = f"未来 {days} 天"
+        else:
+            range_text = "未来 14 天"
+        today = self._calendar_today()
+        today_count = sum(1 for item in items if item.get("local_date") == today)
+
+        if not account_connected:
+            description = "请先完成 Trakt OAuth 授权后刷新个人剧集日历。"
+        elif not items and page_record:
+            description = "当前日期范围内没有个人剧集播出日程。"
+        elif not items:
+            description = "暂无本地日历快照，请点击“刷新日历”。"
+        else:
+            description = (
+                f"{range_text} · 共 {len(items)} 集 · 今天 {today_count} 集 · "
+                f"最后刷新 {fetched_at}"
+            )
+
+        content = [
+            {
+                "component": "div",
+                "props": {
+                    "class": "d-flex flex-wrap align-center justify-space-between px-4 pt-3"
+                },
+                "content": [
+                    {"component": "div", "props": {"class": "text-h6"}, "text": "个人剧集日历"},
+                    self._action_button(
+                        "刷新日历",
+                        "calendar/refresh",
+                        icon="mdi-calendar-refresh",
+                    ),
+                ],
+            },
+            {"component": "VCardText", "text": description},
+            {
+                "component": "VCardText",
+                "props": {"class": "pt-0 text-medium-emphasis"},
+                "text": f"刷新状态：{status_state}；{status_message}；时间：{status_time}",
+            },
+        ]
+
+        state_colors = {
+            "in_library": "success",
+            "downloading": "info",
+            "pending_library": "warning",
+            "unaired": "secondary",
+            "subscribed": "primary",
+            "missing": "error",
+            "unknown": "default",
+        }
+        weekday_names = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+        grouped = {}
+        for item in items:
+            grouped.setdefault(item.get("local_date") or "待定", []).append(item)
+        for local_date in sorted(grouped):
+            if local_date == "待定":
+                date_title = "待定"
+            else:
+                try:
+                    date_value = datetime.date.fromisoformat(local_date)
+                    date_title = (
+                        f"{date_value.strftime('%m月%d日')} "
+                        f"{weekday_names[date_value.weekday()]}"
+                    )
+                except ValueError:
+                    date_title = local_date
+            episode_cards = []
+            for item in sorted(grouped[local_date], key=self._calendar_sort_key):
+                season = self._as_int(item.get("season")) or 0
+                episode = self._as_int(item.get("episode")) or 0
+                state = item.get("moviepilot_state") or "unknown"
+                state_label = item.get("moviepilot_state_label") or self._calendar_state_labels[
+                    "unknown"
+                ]
+                if item.get("moviepilot_state_stale"):
+                    state_label = f"{state_label}（旧状态）"
+                subtitle_parts = [f"S{season:02d}E{episode:02d}"]
+                if item.get("episode_title"):
+                    subtitle_parts.append(str(item.get("episode_title")))
+                detail_parts = []
+                if item.get("local_time"):
+                    detail_parts.append(str(item.get("local_time")))
+                if item.get("network"):
+                    detail_parts.append(str(item.get("network")))
+                row_content = []
+                if item.get("poster"):
+                    row_content.append(
+                        {
+                            "component": "VImg",
+                            "props": {
+                                "src": item.get("poster"),
+                                "height": 120,
+                                "width": 80,
+                                "cover": True,
+                            },
+                        }
+                    )
+                row_content.append(
+                    {
+                        "component": "div",
+                        "props": {"class": "flex-grow-1 pa-3"},
+                        "content": [
+                            {
+                                "component": "div",
+                                "props": {"class": "text-subtitle-1 font-weight-bold"},
+                                "text": item.get("show_title") or "未知剧集",
+                            },
+                            {
+                                "component": "div",
+                                "props": {"class": "text-body-2 mt-1"},
+                                "text": " · ".join(subtitle_parts),
+                            },
+                            {
+                                "component": "div",
+                                "props": {"class": "text-caption text-medium-emphasis mt-1"},
+                                "text": " · ".join(detail_parts) or "播出时间待定",
+                            },
+                            {
+                                "component": "VChip",
+                                "props": {
+                                    "size": "small",
+                                    "variant": "tonal",
+                                    "color": state_colors.get(state, "default"),
+                                    "class": "mt-2",
+                                },
+                                "text": state_label,
+                            },
+                        ],
+                    }
+                )
+                episode_cards.append(
+                    {
+                        "component": "VCard",
+                        "props": {"variant": "tonal"},
+                        "content": [
+                            {
+                                "component": "div",
+                                "props": {"class": "d-flex flex-row"},
+                                "content": row_content,
+                            }
+                        ],
+                    }
+                )
+            content.append(
+                {
+                    "component": "VCard",
+                    "props": {"variant": "outlined", "class": "mx-4 mb-3"},
+                    "content": [
+                        {"component": "VCardTitle", "text": date_title},
+                        {
+                            "component": "div",
+                            "props": {"class": "grid gap-3 grid-info-card px-4 pb-4"},
+                            "content": episode_cards,
+                        },
+                    ],
+                }
+            )
+
+        return {
+            "component": "VCard",
+            "props": {"variant": "outlined", "class": "mb-3"},
+            "content": content,
+        }
+
     def get_page(self) -> List[dict]:
         """详情页只读取插件本地数据，远程操作均通过 Bearer API 触发。"""
         account_record = self.get_data(self._account_key) or {}
@@ -688,6 +1013,12 @@ class TraktSync(_PluginBase):
                 ],
             }
         ]
+        pages.append(
+            self._calendar_page_card(
+                account.get("uuid"),
+                account_connected=bool(account),
+            )
+        )
 
         list_cards = []
         for item in catalog:
@@ -871,6 +1202,13 @@ class TraktSync(_PluginBase):
                 "auth": "bear",
             },
             {
+                "path": "/calendar/refresh",
+                "endpoint": self.api_calendar_refresh,
+                "methods": ["POST"],
+                "summary": "刷新 Trakt 个人剧集日历",
+                "auth": "bear",
+            },
+            {
                 "path": "/custom_lists/refresh",
                 "endpoint": self.api_refresh_custom_lists,
                 "methods": ["POST"],
@@ -915,6 +1253,31 @@ class TraktSync(_PluginBase):
             return schemas.Response(success=False, message="scope 仅支持 all、public、personal")
         removed = self._clear_cached_data(scope)
         return schemas.Response(success=True, message=f"已清理 {removed} 条 Trakt 缓存")
+
+    def api_calendar_refresh(self):
+        if not _calendar_refresh_lock.acquire(blocking=False):
+            logger.warning("Trakt 日历手动刷新未启动：已有刷新任务正在运行")
+            return schemas.Response(success=False, message="Trakt 日历正在刷新")
+        account = (self.get_data(self._account_key) or {}).get("data") or {}
+        self.save_data(
+            self._calendar_status_data_key(account.get("uuid")),
+            {
+                "state": "queued",
+                "message": "手动刷新日历已进入后台队列",
+                "started_at": self._now_iso(),
+            },
+        )
+        logger.info("Trakt 日历手动刷新已进入后台队列")
+        try:
+            Thread(
+                target=self.refresh_calendar_page,
+                kwargs={"force_refresh": True, "lock_acquired": True},
+                daemon=True,
+            ).start()
+        except Exception:
+            _calendar_refresh_lock.release()
+            raise
+        return schemas.Response(success=True, message="已启动 Trakt 日历后台刷新")
 
     def api_refresh_custom_lists(self):
         payload = self.get_trakt_custom_lists(
@@ -1065,33 +1428,166 @@ class TraktSync(_PluginBase):
             def __init__(tool_self, session_id, user_id):
                 super().__init__(session_id, user_id, plugin_instance=plugin_ref)
 
-        return [BoundListsTool, BoundPersonalTool, BoundCustomListsTool]
+        class BoundCalendarTool(GetTraktCalendarTool):
+            def __init__(tool_self, session_id, user_id):
+                super().__init__(session_id, user_id, plugin_instance=plugin_ref)
+
+        return [
+            BoundListsTool,
+            BoundPersonalTool,
+            BoundCustomListsTool,
+            BoundCalendarTool,
+        ]
+
+    def refresh_calendar_page(
+        self,
+        force_refresh: bool = False,
+        lock_acquired: bool = False,
+    ) -> Dict[str, Any]:
+        """后台刷新详情页使用的未来 14 天个人剧集日历快照。"""
+        acquired_here = False
+        if not lock_acquired:
+            acquired_here = _calendar_refresh_lock.acquire(blocking=False)
+            if not acquired_here:
+                logger.info("Trakt 日历定时刷新已跳过：已有刷新任务正在运行")
+                return {"success": False, "message": "日历刷新任务正在运行"}
+        started = time.monotonic()
+        account_uuid = None
+        status_key = self._calendar_status_data_key()
+        try:
+            account = (self.get_data(self._account_key) or {}).get("data") or {}
+            account_uuid = account.get("uuid")
+            status_key = self._calendar_status_data_key(account_uuid)
+            started_at = self._now_iso()
+            self.save_data(
+                status_key,
+                {
+                    "state": "running",
+                    "message": "正在刷新未来 14 天个人剧集日历",
+                    "started_at": started_at,
+                },
+            )
+            logger.info(
+                "Trakt 日历刷新开始："
+                f"模式={'强制刷新' if force_refresh else '定时刷新'}，范围=未来14天"
+            )
+            start_date = self._calendar_today()
+            payload = self.get_trakt_calendar(
+                target="my",
+                calendar_type="shows",
+                start_date=start_date,
+                days=14,
+                page=1,
+                limit=100,
+                force_refresh=force_refresh,
+            )
+            if not payload.get("success"):
+                message = (
+                    payload.get("meta", {})
+                    .get("error", {})
+                    .get("message")
+                    or "日历查询失败"
+                )
+                raise TraktRequestError(message)
+
+            account = (self.get_data(self._account_key) or {}).get("data") or {}
+            account_uuid = account.get("uuid")
+            resolved_status_key = self._calendar_status_data_key(account_uuid)
+            if resolved_status_key != status_key:
+                self.del_data(status_key)
+                status_key = resolved_status_key
+            snapshot_key = self._calendar_snapshot_key(
+                account_uuid,
+                "shows",
+                start_date,
+                14,
+            )
+            snapshot = self.get_data(snapshot_key) or {}
+            page_key = self._calendar_page_data_key(account_uuid)
+            previous_page = self.get_data(page_key) or {}
+            stale = bool(payload.get("meta", {}).get("stale"))
+            if snapshot.get("data") is None:
+                raise TraktRequestError("日历刷新未生成本地快照")
+            if not stale or not previous_page:
+                self.save_data(
+                    page_key,
+                    {
+                        "timestamp": time.time(),
+                        "fetched_at": snapshot.get("fetched_at") or self._now_iso(),
+                        "start_date": start_date,
+                        "days": 14,
+                        "timezone": str(settings.TZ),
+                        "data": snapshot.get("data") or [],
+                        "meta": payload.get("meta") or {},
+                    },
+                )
+
+            duration = round(time.monotonic() - started, 2)
+            total = len(snapshot.get("data") or [])
+            state = "stale" if stale else "success"
+            message = (
+                f"Trakt 实时请求失败，继续保留旧日历（{total} 集）"
+                if stale
+                else f"已刷新 {total} 集未来播出日程"
+            )
+            self.save_data(
+                status_key,
+                {
+                    "state": state,
+                    "message": message,
+                    "started_at": started_at,
+                    "finished_at": self._now_iso(),
+                    "duration_seconds": duration,
+                    "item_count": total,
+                },
+            )
+            logger.info(
+                f"Trakt 日历刷新完成：状态={state}，条目={total}，耗时={duration}秒"
+            )
+            return {"success": True, "state": state, "item_count": total}
+        except Exception as exc:
+            duration = round(time.monotonic() - started, 2)
+            message = self._safe_error(str(exc)) or "日历刷新失败"
+            self.save_data(
+                status_key,
+                {
+                    "state": "failed",
+                    "message": message,
+                    "finished_at": self._now_iso(),
+                    "duration_seconds": duration,
+                },
+            )
+            logger.error(f"Trakt 日历刷新失败：{message}，耗时={duration}秒")
+            return {"success": False, "message": message}
+        finally:
+            if lock_acquired or acquired_here:
+                _calendar_refresh_lock.release()
 
     def get_state(self) -> bool:
         return self._enabled
 
     def get_service(self) -> List[Dict[str, Any]]:
-        if self._enabled and self._cron:
-            return [
-                {
-                    "id": "TraktSync",
-                    "name": "Trakt Watchlist 与自定义列表增量同步",
-                    "trigger": CronTrigger.from_crontab(self._cron),
-                    "func": self.sync_watchlist,
-                    "kwargs": {},
-                }
-            ]
-        if self._enabled:
-            return [
-                {
-                    "id": "TraktSync",
-                    "name": "Trakt Watchlist 与自定义列表增量同步",
-                    "trigger": "interval",
-                    "func": self.sync_watchlist,
-                    "kwargs": {"minutes": 30},
-                }
-            ]
-        return []
+        if not self._enabled:
+            return []
+        sync_service = {
+            "id": "TraktSync",
+            "name": "Trakt Watchlist 与自定义列表增量同步",
+            "trigger": (
+                CronTrigger.from_crontab(self._cron)
+                if self._cron
+                else "interval"
+            ),
+            "func": self.sync_watchlist,
+            "kwargs": {} if self._cron else {"minutes": 30},
+        }
+        calendar_service = {
+            "id": "TraktSyncCalendar",
+            "name": "Trakt 个人剧集日历刷新",
+            "trigger": "interval",
+            "func": self.refresh_calendar_page,
+            "kwargs": {"hours": 1},
+        }
+        return [sync_service, calendar_service]
 
     def stop_service(self):
         try:
@@ -1110,7 +1606,15 @@ class TraktSync(_PluginBase):
     @staticmethod
     def _safe_error(message: str) -> str:
         """错误信息只保留状态和端点，不返回响应正文或凭证。"""
-        return str(message).replace("\n", " ")[:500]
+        value = str(message).replace("\n", " ")
+        value = re.sub(r"(?i)Bearer\s+[^\s,;]+", "Bearer ***", value)
+        value = re.sub(
+            r"(?i)(access_token|refresh_token|client_secret|authorization)"
+            r"\s*[:=]\s*[^\s,;&]+",
+            r"\1=***",
+            value,
+        )
+        return value[:500]
 
     @staticmethod
     def _failure_payload(code: str, message: str, **meta) -> Dict[str, Any]:
@@ -1359,6 +1863,39 @@ class TraktSync(_PluginBase):
             f"{self._account_cache_component(account_uuid)}"
         )
 
+    def _calendar_snapshot_key(
+        self,
+        account_uuid: Optional[str],
+        calendar_type: str,
+        start_date: str,
+        days: int,
+    ) -> str:
+        digest = hashlib.sha256(
+            f"{calendar_type}:{start_date}:{days}".encode("utf-8")
+        ).hexdigest()[:20]
+        return (
+            f"{self._calendar_snapshot_prefix}"
+            f"{self._account_cache_component(account_uuid)}_{digest}"
+        )
+
+    def _calendar_page_data_key(self, account_uuid: Optional[str] = None) -> str:
+        if not account_uuid:
+            account = (self.get_data(self._account_key) or {}).get("data") or {}
+            account_uuid = account.get("uuid")
+        return (
+            f"{self._calendar_page_prefix}"
+            f"{self._account_cache_component(account_uuid)}"
+        )
+
+    def _calendar_status_data_key(self, account_uuid: Optional[str] = None) -> str:
+        if not account_uuid:
+            account = (self.get_data(self._account_key) or {}).get("data") or {}
+            account_uuid = account.get("uuid")
+        return (
+            f"{self._calendar_status_prefix}"
+            f"{self._account_cache_component(account_uuid)}"
+        )
+
     def _cache_key(
         self,
         scope: str,
@@ -1470,6 +2007,9 @@ class TraktSync(_PluginBase):
                     f"{self._cache_prefix}personal_",
                     f"{self._discover_cache_prefix}personal_",
                     f"{self._custom_list_catalog_key}_",
+                    self._calendar_snapshot_prefix,
+                    self._calendar_page_prefix,
+                    self._calendar_status_prefix,
                 ]
             )
         keys = []
@@ -1682,6 +2222,651 @@ class TraktSync(_PluginBase):
             "metrics": metrics,
         }
         return {key: value for key, value in normalized.items() if value not in (None, {}, "")}
+
+    @staticmethod
+    def _moviepilot_timezone():
+        """返回 MoviePilot 配置时区，无效配置时安全退回 UTC。"""
+        try:
+            return ZoneInfo(str(settings.TZ))
+        except (ZoneInfoNotFoundError, ValueError, TypeError, SystemError):
+            return datetime.timezone.utc
+
+    def _calendar_today(self) -> str:
+        return datetime.datetime.now(self._moviepilot_timezone()).date().isoformat()
+
+    @staticmethod
+    def _parse_trakt_datetime(value: Optional[str]) -> Optional[datetime.datetime]:
+        if not value or not isinstance(value, str):
+            return None
+        normalized = value.strip()
+        if not normalized:
+            return None
+        if normalized.endswith("Z"):
+            normalized = f"{normalized[:-1]}+00:00"
+        try:
+            parsed = datetime.datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+        return parsed
+
+    def _calendar_local_parts(self, value: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+        parsed = self._parse_trakt_datetime(value)
+        if not parsed:
+            return None, None
+        local_value = parsed.astimezone(self._moviepilot_timezone())
+        return local_value.date().isoformat(), local_value.strftime("%H:%M")
+
+    @staticmethod
+    def _first_image_url(images: Any) -> Optional[str]:
+        """兼容 Trakt 图片数组以及历史字典结构。"""
+        if isinstance(images, str):
+            value = images.strip()
+            return value or None
+        if isinstance(images, list):
+            for item in images:
+                resolved = TraktSync._first_image_url(item)
+                if resolved:
+                    return resolved
+            return None
+        if isinstance(images, dict):
+            for key in ("poster", "thumb", "fanart", "banner", "screenshot"):
+                resolved = TraktSync._first_image_url(images.get(key))
+                if resolved:
+                    return resolved
+            for key in ("full", "medium", "thumb"):
+                resolved = TraktSync._first_image_url(images.get(key))
+                if resolved:
+                    return resolved
+        return None
+
+    @staticmethod
+    def _calendar_event_id(*parts: Any) -> str:
+        normalized = ":".join(str(part) for part in parts if part not in (None, ""))
+        return normalized or hashlib.sha256(repr(parts).encode("utf-8")).hexdigest()[:20]
+
+    def _normalize_calendar_item(self, raw_item: dict, calendar_type: str) -> dict:
+        wrapper = raw_item if isinstance(raw_item, dict) else {}
+        if calendar_type in self._calendar_show_types:
+            show = wrapper.get("show") if isinstance(wrapper.get("show"), dict) else {}
+            episode = (
+                wrapper.get("episode")
+                if isinstance(wrapper.get("episode"), dict)
+                else {}
+            )
+            show_ids = show.get("ids") or {}
+            episode_ids = episode.get("ids") or {}
+            first_aired = wrapper.get("first_aired") or episode.get("first_aired")
+            local_date, local_time = self._calendar_local_parts(first_aired)
+            season = episode.get("season")
+            episode_number = episode.get("number")
+            event_id = self._calendar_event_id(
+                "show",
+                show_ids.get("trakt") or show_ids.get("tmdb") or show.get("title"),
+                season,
+                episode_number,
+            )
+            normalized = {
+                "event_id": event_id,
+                "type": "episode",
+                "first_aired": first_aired,
+                "local_date": local_date,
+                "local_time": local_time,
+                "show_title": show.get("title"),
+                "show_year": show.get("year"),
+                "show_trakt_id": show_ids.get("trakt"),
+                "show_tmdb_id": show_ids.get("tmdb"),
+                "show_imdb_id": show_ids.get("imdb"),
+                "show_tvdb_id": show_ids.get("tvdb"),
+                "network": show.get("network"),
+                "episode_title": episode.get("title"),
+                "season": season,
+                "episode": episode_number,
+                "episode_trakt_id": episode_ids.get("trakt"),
+                "episode_tmdb_id": episode_ids.get("tmdb"),
+                "episode_tvdb_id": episode_ids.get("tvdb"),
+                "overview": episode.get("overview") or show.get("overview"),
+                "runtime": episode.get("runtime") or show.get("runtime"),
+                "poster": self._first_image_url(show.get("images")),
+            }
+        else:
+            movie = wrapper.get("movie") if isinstance(wrapper.get("movie"), dict) else {}
+            ids = movie.get("ids") or {}
+            released = wrapper.get("released") or movie.get("released")
+            event_id = self._calendar_event_id(
+                "movie",
+                ids.get("trakt") or ids.get("tmdb") or movie.get("title"),
+                released,
+            )
+            normalized = {
+                "event_id": event_id,
+                "type": "movie",
+                "released": released,
+                "local_date": released,
+                "title": movie.get("title"),
+                "year": movie.get("year"),
+                "trakt_id": ids.get("trakt"),
+                "tmdb_id": ids.get("tmdb"),
+                "imdb_id": ids.get("imdb"),
+                "tvdb_id": ids.get("tvdb"),
+                "overview": movie.get("overview"),
+                "runtime": movie.get("runtime"),
+                "poster": self._first_image_url(movie.get("images")),
+            }
+        return {
+            key: self._sanitize_payload(value)
+            for key, value in normalized.items()
+            if value not in (None, "")
+        }
+
+    @staticmethod
+    def _calendar_sort_key(item: dict) -> Tuple[str, str, int, int]:
+        timestamp = item.get("first_aired") or item.get("released") or ""
+        title = item.get("show_title") or item.get("title") or ""
+        return (
+            str(timestamp),
+            str(title).casefold(),
+            int(item.get("season") or 0),
+            int(item.get("episode") or 0),
+        )
+
+    @staticmethod
+    def _object_value(value: Any, key: str, default: Any = None) -> Any:
+        if isinstance(value, dict):
+            return value.get(key, default)
+        return getattr(value, key, default)
+
+    @staticmethod
+    def _as_int(value: Any) -> Optional[int]:
+        if isinstance(value, bool) or value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _marked_numbers(value: Any, marker: str) -> set:
+        if value is None:
+            return set()
+        if isinstance(value, int) and not isinstance(value, bool):
+            return {value}
+        return {
+            int(number)
+            for number in re.findall(
+                rf"(?i){re.escape(marker)}\s*0*(\d+)(?!\d)",
+                str(value),
+            )
+        }
+
+    @classmethod
+    def _number_set(cls, value: Any, marker: str) -> set:
+        marked = cls._marked_numbers(value, marker)
+        if marked:
+            return marked
+        plain = cls._as_int(value)
+        return {plain} if plain is not None else set()
+
+    def _load_calendar_downloads(self) -> List[dict]:
+        """一次性读取下载任务并用下载历史补充媒体标识。"""
+        torrents = self.downloadchain.list_torrents(include_all_tags=False) or []
+        hashes = [
+            self._object_value(torrent, "hash")
+            for torrent in torrents
+            if self._object_value(torrent, "hash")
+        ]
+        history_map = DownloadHistoryOper().get_by_hashes(hashes) if hashes else {}
+        records = []
+        for torrent in torrents:
+            torrent_hash = self._object_value(torrent, "hash")
+            history = history_map.get(torrent_hash) if torrent_hash else None
+            media = self._object_value(torrent, "media") or {}
+            tmdb_id = self._object_value(media, "tmdbid")
+            if tmdb_id is None:
+                tmdb_id = self._object_value(history, "tmdbid")
+            season_value = self._object_value(media, "season")
+            if season_value is None:
+                season_value = self._object_value(history, "seasons")
+            episode_value = self._object_value(media, "episode")
+            if episode_value is None:
+                episode_value = self._object_value(history, "episodes")
+            title_values = [
+                self._object_value(torrent, "season_episode"),
+                self._object_value(torrent, "title"),
+                self._object_value(torrent, "name"),
+                self._object_value(media, "title"),
+                self._object_value(history, "title"),
+                season_value,
+                episode_value,
+            ]
+            state = self._object_value(torrent, "state")
+            state = self._object_value(state, "value", state)
+            records.append(
+                {
+                    "tmdb_id": self._as_int(tmdb_id),
+                    "season": season_value,
+                    "episode": episode_value,
+                    "text": " ".join(
+                        str(value) for value in title_values if value not in (None, "")
+                    ),
+                    "state": str(state or "").lower(),
+                }
+            )
+        return records
+
+    def _calendar_download_matches(self, item: dict, download: dict) -> bool:
+        show_tmdb_id = self._as_int(item.get("show_tmdb_id"))
+        task_tmdb_id = self._as_int(download.get("tmdb_id"))
+        text = str(download.get("text") or "")
+        if task_tmdb_id is not None:
+            if show_tmdb_id is None or task_tmdb_id != show_tmdb_id:
+                return False
+        else:
+            show_title = str(item.get("show_title") or "").strip().casefold()
+            if not show_title or show_title not in text.casefold():
+                return False
+
+        season = self._as_int(item.get("season"))
+        episode = self._as_int(item.get("episode"))
+        if season is None or episode is None:
+            return False
+
+        season_numbers = self._number_set(download.get("season"), "S")
+        if not season_numbers:
+            season_numbers = self._marked_numbers(text, "S")
+        if not season_numbers or season not in season_numbers:
+            return False
+
+        episode_numbers = self._number_set(download.get("episode"), "E")
+        if not episode_numbers:
+            episode_numbers = self._marked_numbers(text, "E")
+        return not episode_numbers or episode in episode_numbers
+
+    def _calendar_is_subscribed(self, item: dict, subscriptions: List[Any]) -> bool:
+        show_tmdb_id = self._as_int(item.get("show_tmdb_id"))
+        season = self._as_int(item.get("season"))
+        if show_tmdb_id is None or season is None:
+            return False
+        for subscribe in subscriptions:
+            if self._as_int(self._object_value(subscribe, "tmdbid")) != show_tmdb_id:
+                continue
+            subscribed_season = self._object_value(subscribe, "season")
+            if subscribed_season in (None, ""):
+                return True
+            if season in self._number_set(subscribed_season, "S"):
+                return True
+        return False
+
+    def _query_calendar_library(self, item: dict) -> dict:
+        """识别一部剧并返回其媒体库季集信息。"""
+        tmdb_id = self._as_int(item.get("show_tmdb_id"))
+        title = item.get("show_title") or ""
+        if tmdb_id is None:
+            raise ValueError("剧集缺少 TMDB ID")
+        meta = MetaInfo(title=title)
+        meta.type = MediaType.TV
+        mediainfo = self.chain.recognize_media(meta=meta, tmdbid=tmdb_id)
+        if not mediainfo:
+            raise ValueError("MoviePilot 未识别到剧集")
+        exists_info = self.chain.media_exists(mediainfo=mediainfo)
+        seasons = self._object_value(exists_info, "seasons", {}) or {}
+        normalized_seasons = {}
+        for raw_season, raw_episodes in seasons.items():
+            season = self._as_int(raw_season)
+            if season is None:
+                continue
+            normalized_seasons[season] = {
+                episode
+                for episode in (
+                    self._as_int(raw_episode) for raw_episode in (raw_episodes or [])
+                )
+                if episode is not None
+            }
+        poster = None
+        get_poster = getattr(mediainfo, "get_poster_image", None)
+        if callable(get_poster):
+            poster = get_poster()
+        return {"seasons": normalized_seasons, "poster": poster}
+
+    @staticmethod
+    def _calendar_episode_in_library(item: dict, library: dict) -> bool:
+        try:
+            season = int(item.get("season"))
+            episode = int(item.get("episode"))
+        except (TypeError, ValueError):
+            return False
+        return episode in (library.get("seasons") or {}).get(season, set())
+
+    def _calendar_previous_state(self, item: dict, previous: dict) -> dict:
+        previous_item = previous.get(item.get("event_id")) or {}
+        state = previous_item.get("moviepilot_state")
+        result = dict(item)
+        if not result.get("poster") and previous_item.get("poster"):
+            result["poster"] = previous_item.get("poster")
+        if state:
+            result["moviepilot_state"] = state
+            result["moviepilot_state_label"] = previous_item.get(
+                "moviepilot_state_label"
+            ) or self._calendar_state_labels.get(state, "状态未知")
+        else:
+            result["moviepilot_state"] = "unknown"
+            result["moviepilot_state_label"] = self._calendar_state_labels["unknown"]
+        result["moviepilot_state_stale"] = True
+        return result
+
+    def _set_calendar_state(self, item: dict, state: str) -> dict:
+        result = dict(item)
+        result["moviepilot_state"] = state
+        result["moviepilot_state_label"] = self._calendar_state_labels[state]
+        result.pop("moviepilot_state_stale", None)
+        return result
+
+    def _enrich_calendar_states(
+        self,
+        items: List[dict],
+        previous_items: Optional[List[dict]] = None,
+    ) -> Tuple[List[dict], dict]:
+        """按剧集批量加载 MoviePilot 数据并计算逐集状态。"""
+        previous = {
+            item.get("event_id"): item
+            for item in (previous_items or [])
+            if item.get("event_id")
+        }
+        downloads = []
+        subscriptions = []
+        downloads_failed = False
+        subscriptions_failed = False
+        try:
+            downloads = self._load_calendar_downloads()
+        except Exception as exc:
+            downloads_failed = True
+            logger.warning(
+                f"Trakt 日历读取 MoviePilot 下载任务失败：{self._safe_error(str(exc))}"
+            )
+        try:
+            subscriptions = SubscribeOper().list() or []
+        except Exception as exc:
+            subscriptions_failed = True
+            logger.warning(
+                f"Trakt 日历读取 MoviePilot 订阅失败：{self._safe_error(str(exc))}"
+            )
+
+        unique_shows = {}
+        for item in items:
+            tmdb_id = self._as_int(item.get("show_tmdb_id"))
+            if tmdb_id is not None and tmdb_id not in unique_shows:
+                unique_shows[tmdb_id] = item
+
+        library_results = {}
+        library_failures = set()
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {
+                executor.submit(self._query_calendar_library, item): tmdb_id
+                for tmdb_id, item in unique_shows.items()
+            }
+            for future in as_completed(futures):
+                tmdb_id = futures[future]
+                try:
+                    library_results[tmdb_id] = future.result()
+                except Exception as exc:
+                    library_failures.add(tmdb_id)
+                    logger.warning(
+                        "Trakt 日历查询 MoviePilot 媒体库失败："
+                        f"tmdb={tmdb_id}，{self._safe_error(str(exc))}"
+                    )
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        enriched = []
+        stale_count = 0
+        for item in items:
+            tmdb_id = self._as_int(item.get("show_tmdb_id"))
+            season = self._as_int(item.get("season"))
+            episode = self._as_int(item.get("episode"))
+            if tmdb_id is None or not season or episode is None or tmdb_id in library_failures:
+                result = self._calendar_previous_state(item, previous)
+                stale_count += 1
+                enriched.append(result)
+                continue
+
+            library = library_results.get(tmdb_id) or {"seasons": {}}
+            item_with_poster = dict(item)
+            if not item_with_poster.get("poster") and library.get("poster"):
+                item_with_poster["poster"] = library.get("poster")
+            if self._calendar_episode_in_library(item_with_poster, library):
+                enriched.append(self._set_calendar_state(item_with_poster, "in_library"))
+                continue
+            if downloads_failed:
+                result = self._calendar_previous_state(item_with_poster, previous)
+                stale_count += 1
+                enriched.append(result)
+                continue
+
+            matching_downloads = [
+                download
+                for download in downloads
+                if self._calendar_download_matches(item_with_poster, download)
+            ]
+            if any(
+                download.get("state") not in ("completed", "seeding")
+                for download in matching_downloads
+            ):
+                enriched.append(self._set_calendar_state(item_with_poster, "downloading"))
+                continue
+            if matching_downloads:
+                enriched.append(
+                    self._set_calendar_state(item_with_poster, "pending_library")
+                )
+                continue
+
+            first_aired = self._parse_trakt_datetime(item_with_poster.get("first_aired"))
+            if first_aired is None or first_aired > now:
+                enriched.append(self._set_calendar_state(item_with_poster, "unaired"))
+                continue
+            if subscriptions_failed:
+                result = self._calendar_previous_state(item_with_poster, previous)
+                stale_count += 1
+                enriched.append(result)
+                continue
+            if self._calendar_is_subscribed(item_with_poster, subscriptions):
+                enriched.append(self._set_calendar_state(item_with_poster, "subscribed"))
+            else:
+                enriched.append(self._set_calendar_state(item_with_poster, "missing"))
+
+        return enriched, {
+            "moviepilot_status_stale": stale_count > 0,
+            "moviepilot_status_stale_count": stale_count,
+            "moviepilot_status_lookup_errors": (
+                len(library_failures)
+                + int(downloads_failed)
+                + int(subscriptions_failed)
+            ),
+        }
+
+    def get_trakt_calendar(
+        self,
+        target: str = "my",
+        calendar_type: str = "shows",
+        start_date: Optional[str] = None,
+        days: int = 14,
+        page: int = 1,
+        limit: int = 20,
+        force_refresh: bool = False,
+    ) -> Dict[str, Any]:
+        """查询 Trakt 日历，并按需附加 MoviePilot 逐集状态。"""
+        target = (target or "").lower()
+        calendar_type = (calendar_type or "").lower()
+        try:
+            if target not in ("my", "all"):
+                raise ValueError("target 仅支持 my、all")
+            if calendar_type not in self._calendar_paths:
+                raise ValueError(
+                    "calendar_type 仅支持 shows、movies、new_shows、"
+                    "season_premieres、finales、dvd"
+                )
+            if isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= 33:
+                raise ValueError("days 必须在 1 到 33 之间")
+            if isinstance(page, bool) or not isinstance(page, int) or page < 1:
+                raise ValueError("page 必须大于等于 1")
+            if (
+                isinstance(limit, bool)
+                or not isinstance(limit, int)
+                or limit < 1
+                or limit > 100
+            ):
+                raise ValueError("limit 必须在 1 到 100 之间")
+            start_date = start_date or self._calendar_today()
+            try:
+                parsed_start = datetime.date.fromisoformat(start_date)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("start_date 必须是 YYYY-MM-DD 格式") from exc
+            if parsed_start.isoformat() != start_date:
+                raise ValueError("start_date 必须是 YYYY-MM-DD 格式")
+
+            account_meta = None
+            account_uuid = None
+            if target == "my":
+                account, account_meta = self._get_account(force_refresh=force_refresh)
+                account_uuid = account.get("uuid")
+                if not account_uuid:
+                    raise TraktRequestError("Trakt 账户缺少 UUID")
+
+            include_moviepilot_status = (
+                target == "my" and calendar_type in self._calendar_show_types
+            )
+            snapshot_key = None
+            snapshot = {}
+            if include_moviepilot_status:
+                snapshot_key = self._calendar_snapshot_key(
+                    account_uuid,
+                    calendar_type,
+                    start_date,
+                    days,
+                )
+                snapshot = self.get_data(snapshot_key) or {}
+                snapshot_fresh = (
+                    bool(snapshot.get("data") is not None)
+                    and time.time() - float(snapshot.get("timestamp") or 0)
+                    < self._calendar_cache_ttl
+                )
+                if snapshot_fresh and not force_refresh:
+                    all_data = snapshot.get("data") or []
+                    cache_meta = {
+                        "cached": True,
+                        "stale": bool((snapshot.get("cache") or {}).get("stale")),
+                        "fetched_at": snapshot.get("fetched_at"),
+                    }
+                    if (snapshot.get("cache") or {}).get("fallback_reason"):
+                        cache_meta["fallback_reason"] = snapshot["cache"][
+                            "fallback_reason"
+                        ]
+                    status_meta = snapshot.get("status_meta") or {}
+                else:
+                    all_data = None
+            else:
+                all_data = None
+
+            if all_data is None:
+                endpoint = (
+                    f"/calendars/{target}/{self._calendar_paths[calendar_type]}/"
+                    f"{start_date}/{days}"
+                )
+                try:
+                    response = self._cached_request(
+                        f"calendar:{target}:{calendar_type}",
+                        endpoint,
+                        params={"extended": "full,images"},
+                        requires_auth=target == "my",
+                        ttl=self._calendar_cache_ttl,
+                        force_refresh=force_refresh,
+                        account_uuid=account_uuid,
+                    )
+                    normalized_items = [
+                        self._normalize_calendar_item(item, calendar_type)
+                        for item in (response.get("data") or [])
+                    ]
+                    normalized_items.sort(key=self._calendar_sort_key)
+                    cache_meta = response.get("cache") or {}
+                    status_meta = {}
+                    if include_moviepilot_status:
+                        normalized_items, status_meta = self._enrich_calendar_states(
+                            normalized_items,
+                            previous_items=snapshot.get("data") or [],
+                        )
+                        fetched_at = self._now_iso()
+                        snapshot = {
+                            "timestamp": time.time(),
+                            "fetched_at": fetched_at,
+                            "account_uuid": account_uuid,
+                            "calendar_type": calendar_type,
+                            "start_date": start_date,
+                            "days": days,
+                            "data": normalized_items,
+                            "cache": cache_meta,
+                            "status_meta": status_meta,
+                        }
+                        self.save_data(snapshot_key, snapshot)
+                        cache_meta = {
+                            "cached": False,
+                            "stale": bool(cache_meta.get("stale")),
+                            "fetched_at": fetched_at,
+                            **(
+                                {"fallback_reason": cache_meta.get("fallback_reason")}
+                                if cache_meta.get("fallback_reason")
+                                else {}
+                            ),
+                        }
+                    all_data = normalized_items
+                except TraktRequestError as exc:
+                    if include_moviepilot_status and snapshot.get("data") is not None:
+                        all_data = snapshot.get("data") or []
+                        cache_meta = {
+                            "cached": True,
+                            "stale": True,
+                            "fetched_at": snapshot.get("fetched_at"),
+                            "fallback_reason": self._safe_error(str(exc)),
+                        }
+                        status_meta = snapshot.get("status_meta") or {}
+                    else:
+                        raise
+
+            start = (page - 1) * limit
+            page_data = all_data[start : start + limit]
+            meta = {
+                "target": target,
+                "calendar_type": calendar_type,
+                "start_date": start_date,
+                "days": days,
+                "timezone": str(settings.TZ),
+                "pagination": self._pagination_meta(
+                    {},
+                    page,
+                    limit,
+                    len(page_data),
+                    total=len(all_data),
+                ),
+                "moviepilot_status_included": include_moviepilot_status,
+                **cache_meta,
+                **status_meta,
+            }
+            if account_meta is not None:
+                meta["account_cache"] = account_meta
+            return {
+                "success": True,
+                "meta": meta,
+                "data": self._sanitize_payload(page_data),
+            }
+        except ValueError as exc:
+            return self._failure_payload("invalid_parameters", str(exc))
+        except TraktRequestError as exc:
+            return self._failure_payload(
+                "trakt_request_failed",
+                str(exc),
+                target=target,
+                calendar_type=calendar_type,
+                start_date=start_date,
+                days=days,
+            )
 
     @staticmethod
     def _list_endpoint(category: str, media_type: str, period: str) -> str:

@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import importlib.util
 import json
 import sys
@@ -91,6 +92,8 @@ class _SubscribeOper:
     subscriptions = {}
     exists_result = False
     exists_calls = []
+    listed = []
+    list_calls = 0
 
     def get(self, sub_id):
         return self.subscriptions.get(sub_id)
@@ -98,6 +101,23 @@ class _SubscribeOper:
     def exists(self, **kwargs):
         self.exists_calls.append(kwargs)
         return self.exists_result
+
+    def list(self):
+        type(self).list_calls += 1
+        return list(type(self).listed)
+
+
+class _DownloadHistoryOper:
+    histories = {}
+    calls = []
+
+    def get_by_hashes(self, hashes):
+        type(self).calls.append(list(hashes))
+        return {
+            hash_value: type(self).histories[hash_value]
+            for hash_value in hashes
+            if hash_value in type(self).histories
+        }
 
 
 def _load_plugin_module_with_stubs():
@@ -122,6 +142,10 @@ def _load_plugin_module_with_stubs():
     _install_module("app.chain.download", DownloadChain=_Dummy)
     _install_module("app.chain.subscribe", SubscribeChain=_Dummy)
     _install_module("app.db")
+    _install_module(
+        "app.db.downloadhistory_oper",
+        DownloadHistoryOper=_DownloadHistoryOper,
+    )
     _install_module("app.db.subscribe_oper", SubscribeOper=_SubscribeOper)
 
     class _ChainEventType:
@@ -248,6 +272,54 @@ def _show_item(trakt_id=2, tmdb_id=202, title="Show"):
     }
 
 
+def _calendar_show_item(
+    show_trakt_id=2,
+    show_tmdb_id=202,
+    title="Show",
+    season=1,
+    episode=1,
+    episode_trakt_id=2001,
+    first_aired="2026-01-01T12:00:00Z",
+):
+    return {
+        "first_aired": first_aired,
+        "show": {
+            "title": title,
+            "year": 2026,
+            "network": "Network",
+            "overview": "Show overview",
+            "runtime": 45,
+            "images": {"poster": ["poster.jpg"]},
+            "ids": {"trakt": show_trakt_id, "tmdb": show_tmdb_id},
+        },
+        "episode": {
+            "title": f"Episode {episode}",
+            "season": season,
+            "number": episode,
+            "ids": {"trakt": episode_trakt_id, "tmdb": episode_trakt_id + 1},
+        },
+    }
+
+
+def _calendar_movie_item(
+    trakt_id=3,
+    tmdb_id=303,
+    title="Calendar Movie",
+    released="2026-01-02",
+):
+    return {
+        "released": released,
+        "movie": {
+            "title": title,
+            "year": 2026,
+            "overview": "Movie overview",
+            "runtime": 120,
+            "images": {"poster": ["movie-poster.jpg"]},
+            "ids": {"trakt": trakt_id, "tmdb": tmdb_id, "imdb": "tt303"},
+        },
+    }
+
+
 class TraktSyncTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -261,6 +333,10 @@ class TraktSyncTest(unittest.TestCase):
         self.plugin.token = {}
         _SubscribeOper.exists_result = False
         _SubscribeOper.exists_calls.clear()
+        _SubscribeOper.listed = []
+        _SubscribeOper.list_calls = 0
+        _DownloadHistoryOper.histories = {}
+        _DownloadHistoryOper.calls.clear()
 
     def test_all_chart_endpoints_and_period(self):
         cases = {
@@ -382,6 +458,372 @@ class TraktSyncTest(unittest.TestCase):
             self.plugin.get_trakt_lists("popular", "movies", limit=101),
         ]
         self.assertTrue(all(not payload["success"] for payload in invalid_payloads))
+
+    def test_calendar_endpoints_cover_all_types_and_targets(self):
+        self.plugin._get_account = Mock(
+            return_value=({"uuid": "account-uuid"}, {"cached": False})
+        )
+        self.plugin._cached_request = Mock(
+            return_value={
+                "data": [],
+                "pagination": {},
+                "cache": {"cached": False, "stale": False},
+            }
+        )
+        self.plugin._enrich_calendar_states = Mock(return_value=([], {}))
+        expected = {
+            "shows": "shows",
+            "movies": "movies",
+            "new_shows": "shows/new",
+            "season_premieres": "shows/premieres",
+            "finales": "shows/finales",
+            "dvd": "dvd",
+        }
+
+        for target in ("all", "my"):
+            for calendar_type, suffix in expected.items():
+                with self.subTest(target=target, calendar_type=calendar_type):
+                    self.plugin._cached_request.reset_mock()
+                    payload = self.plugin.get_trakt_calendar(
+                        target=target,
+                        calendar_type=calendar_type,
+                        start_date="2026-08-01",
+                        days=14,
+                        force_refresh=True,
+                    )
+                    self.assertTrue(payload["success"])
+                    self.assertEqual(
+                        f"/calendars/{target}/{suffix}/2026-08-01/14",
+                        self.plugin._cached_request.call_args.args[1],
+                    )
+                    self.assertEqual(
+                        target == "my",
+                        self.plugin._cached_request.call_args.kwargs[
+                            "requires_auth"
+                        ],
+                    )
+                    self.assertEqual(
+                        {"extended": "full,images"},
+                        self.plugin._cached_request.call_args.kwargs["params"],
+                    )
+
+    def test_calendar_normalizes_and_pages_locally(self):
+        raw_items = [
+            _calendar_movie_item(
+                trakt_id=index,
+                tmdb_id=1000 + index,
+                title=f"Movie {index}",
+                released=f"2026-08-{index:02d}",
+            )
+            for index in range(1, 26)
+        ]
+        self.plugin._cached_request = Mock(
+            return_value={
+                "data": raw_items,
+                "pagination": {},
+                "cache": {"cached": True, "stale": False, "fetched_at": "now"},
+            }
+        )
+
+        payload = self.plugin.get_trakt_calendar(
+            target="all",
+            calendar_type="movies",
+            start_date="2026-08-01",
+            days=25,
+            page=2,
+            limit=10,
+        )
+
+        self.assertTrue(payload["success"])
+        self.assertEqual(list(range(11, 21)), [item["trakt_id"] for item in payload["data"]])
+        self.assertEqual(25, payload["meta"]["pagination"]["item_count"])
+        self.assertTrue(payload["meta"]["pagination"]["has_more"])
+        self.assertEqual("movie-poster.jpg", payload["data"][0]["poster"])
+        params = self.plugin._cached_request.call_args.kwargs["params"]
+        self.assertNotIn("page", params)
+        self.assertNotIn("limit", params)
+
+    def test_calendar_parameter_validation_and_default_date(self):
+        self.plugin._calendar_today = Mock(return_value="2026-08-01")
+        self.plugin._cached_request = Mock(
+            return_value={
+                "data": [],
+                "pagination": {},
+                "cache": {"cached": False, "stale": False},
+            }
+        )
+
+        defaulted = self.plugin.get_trakt_calendar(target="all", calendar_type="shows")
+        invalid = [
+            self.plugin.get_trakt_calendar(target="missing"),
+            self.plugin.get_trakt_calendar(target="all", calendar_type="awards"),
+            self.plugin.get_trakt_calendar(target="all", days=0),
+            self.plugin.get_trakt_calendar(target="all", days=34),
+            self.plugin.get_trakt_calendar(target="all", start_date="2026/08/01"),
+            self.plugin.get_trakt_calendar(target="all", page=0),
+            self.plugin.get_trakt_calendar(target="all", limit=101),
+        ]
+
+        self.assertTrue(defaulted["success"])
+        self.assertEqual("2026-08-01", defaulted["meta"]["start_date"])
+        self.assertTrue(all(not payload["success"] for payload in invalid))
+        self.assertTrue(
+            all(
+                payload["meta"]["error"]["code"] == "invalid_parameters"
+                for payload in invalid
+            )
+        )
+
+    def test_calendar_groups_air_time_in_moviepilot_timezone(self):
+        self.plugin._moviepilot_timezone = Mock(
+            return_value=datetime.timezone(datetime.timedelta(hours=8))
+        )
+
+        item = self.plugin._normalize_calendar_item(
+            _calendar_show_item(first_aired="2026-07-31T18:30:00Z"),
+            "shows",
+        )
+
+        self.assertEqual("2026-08-01", item["local_date"])
+        self.assertEqual("02:30", item["local_time"])
+
+    def test_calendar_personal_show_status_is_not_exposed_publicly(self):
+        raw = [_calendar_show_item()]
+        self.plugin._get_account = Mock(
+            return_value=({"uuid": "account-uuid"}, {"cached": False})
+        )
+        self.plugin._cached_request = Mock(
+            return_value={
+                "data": raw,
+                "pagination": {},
+                "cache": {"cached": False, "stale": False},
+            }
+        )
+        self.plugin._enrich_calendar_states = Mock(
+            side_effect=lambda items, previous_items=None: (
+                [
+                    {
+                        **items[0],
+                        "moviepilot_state": "missing",
+                        "moviepilot_state_label": "缺失",
+                    }
+                ],
+                {"moviepilot_status_stale": False},
+            )
+        )
+
+        personal = self.plugin.get_trakt_calendar(
+            target="my",
+            calendar_type="shows",
+            start_date="2026-08-01",
+        )
+        public = self.plugin.get_trakt_calendar(
+            target="all",
+            calendar_type="shows",
+            start_date="2026-08-01",
+        )
+        self.plugin._cached_request.return_value = {
+            "data": [_calendar_movie_item()],
+            "pagination": {},
+            "cache": {"cached": False, "stale": False},
+        }
+        personal_movie = self.plugin.get_trakt_calendar(
+            target="my",
+            calendar_type="movies",
+            start_date="2026-08-01",
+        )
+
+        self.assertEqual("missing", personal["data"][0]["moviepilot_state"])
+        self.assertTrue(personal["meta"]["moviepilot_status_included"])
+        self.assertNotIn("moviepilot_state", public["data"][0])
+        self.assertFalse(public["meta"]["moviepilot_status_included"])
+        self.assertNotIn("moviepilot_state", personal_movie["data"][0])
+        self.assertFalse(personal_movie["meta"]["moviepilot_status_included"])
+
+    def test_calendar_moviepilot_six_state_precedence_and_batch_reads(self):
+        raw_items = [
+            _calendar_show_item(
+                show_tmdb_id=200 + index,
+                show_trakt_id=100 + index,
+                title=f"Show {index}",
+                episode=index,
+                episode_trakt_id=1000 + index,
+                first_aired=(
+                    "2099-01-01T00:00:00Z"
+                    if index == 4
+                    else "2020-01-01T00:00:00Z"
+                ),
+            )
+            for index in range(1, 7)
+        ]
+        items = [
+            self.plugin._normalize_calendar_item(item, "shows")
+            for item in raw_items
+        ]
+        downloads = [
+            types.SimpleNamespace(
+                hash="active",
+                state="downloading",
+                title="Show 2 S01E02",
+                name="Show 2 S01E02",
+                season_episode="S01E02",
+                media={
+                    "tmdbid": 202,
+                    "title": "Show 2",
+                    "season": "S01",
+                    "episode": "E02",
+                },
+            ),
+            types.SimpleNamespace(
+                hash="complete",
+                state="seeding",
+                title="Show 3 S01E03",
+                name="Show 3 S01E03",
+                season_episode="S01E03",
+                media={
+                    "tmdbid": 203,
+                    "title": "Show 3",
+                    "season": "S01",
+                    "episode": "E03",
+                },
+            ),
+        ]
+        self.plugin.downloadchain = types.SimpleNamespace(
+            list_torrents=Mock(return_value=downloads)
+        )
+        _SubscribeOper.listed = [types.SimpleNamespace(tmdbid=205, season=1)]
+
+        def recognize_media(meta, tmdbid):
+            return _MediaInfo(tmdb_id=tmdbid, title=meta.title, media_type=_MediaType.TV)
+
+        def media_exists(mediainfo):
+            seasons = {1: [1]} if mediainfo.tmdb_id == 201 else {}
+            return types.SimpleNamespace(seasons=seasons) if seasons else None
+
+        self.plugin.chain = types.SimpleNamespace(
+            recognize_media=Mock(side_effect=recognize_media),
+            media_exists=Mock(side_effect=media_exists),
+        )
+
+        enriched, meta = self.plugin._enrich_calendar_states(items)
+        states = [item["moviepilot_state"] for item in enriched]
+
+        self.assertEqual(
+            [
+                "in_library",
+                "downloading",
+                "pending_library",
+                "unaired",
+                "subscribed",
+                "missing",
+            ],
+            states,
+        )
+        self.assertFalse(meta["moviepilot_status_stale"])
+        self.assertEqual(1, _SubscribeOper.list_calls)
+        self.plugin.downloadchain.list_torrents.assert_called_once_with(
+            include_all_tags=False
+        )
+        self.assertEqual([["active", "complete"]], _DownloadHistoryOper.calls)
+        self.assertEqual(6, self.plugin.chain.recognize_media.call_count)
+        self.assertEqual(6, self.plugin.chain.media_exists.call_count)
+
+    def test_calendar_status_queries_library_once_per_unique_show(self):
+        items = [
+            self.plugin._normalize_calendar_item(
+                _calendar_show_item(
+                    show_tmdb_id=202,
+                    episode=episode,
+                    episode_trakt_id=2000 + episode,
+                    first_aired="2020-01-01T00:00:00Z",
+                ),
+                "shows",
+            )
+            for episode in (1, 2)
+        ]
+        self.plugin.downloadchain = types.SimpleNamespace(
+            list_torrents=Mock(return_value=[])
+        )
+        media = _MediaInfo(tmdb_id=202, title="Show", media_type=_MediaType.TV)
+        self.plugin.chain = types.SimpleNamespace(
+            recognize_media=Mock(return_value=media),
+            media_exists=Mock(return_value=None),
+        )
+
+        enriched, _ = self.plugin._enrich_calendar_states(items)
+
+        self.assertEqual(["missing", "missing"], [item["moviepilot_state"] for item in enriched])
+        self.plugin.chain.recognize_media.assert_called_once()
+        self.plugin.chain.media_exists.assert_called_once()
+        self.assertEqual(1, _SubscribeOper.list_calls)
+
+    def test_calendar_status_failure_preserves_previous_or_unknown(self):
+        item = self.plugin._normalize_calendar_item(
+            _calendar_show_item(first_aired="2020-01-01T00:00:00Z"),
+            "shows",
+        )
+        season_zero = self.plugin._normalize_calendar_item(
+            _calendar_show_item(
+                show_tmdb_id=303,
+                season=0,
+                episode=1,
+                episode_trakt_id=3001,
+                first_aired="2020-01-01T00:00:00Z",
+            ),
+            "shows",
+        )
+        previous = [
+            {
+                **item,
+                "moviepilot_state": "subscribed",
+                "moviepilot_state_label": "已订阅",
+            }
+        ]
+        self.plugin.downloadchain = types.SimpleNamespace(
+            list_torrents=Mock(return_value=[])
+        )
+        self.plugin.chain = types.SimpleNamespace(
+            recognize_media=Mock(side_effect=RuntimeError("media server failed")),
+            media_exists=Mock(),
+        )
+
+        enriched, meta = self.plugin._enrich_calendar_states(
+            [item, season_zero],
+            previous_items=previous,
+        )
+
+        self.assertEqual("subscribed", enriched[0]["moviepilot_state"])
+        self.assertTrue(enriched[0]["moviepilot_state_stale"])
+        self.assertEqual("unknown", enriched[1]["moviepilot_state"])
+        self.assertTrue(enriched[1]["moviepilot_state_stale"])
+        self.assertTrue(meta["moviepilot_status_stale"])
+
+    def test_calendar_download_matching_supports_title_and_whole_season(self):
+        item = {
+            "show_title": "Fallback Show",
+            "show_tmdb_id": 202,
+            "season": 2,
+            "episode": 7,
+        }
+        whole_season = {
+            "tmdb_id": None,
+            "season": None,
+            "episode": None,
+            "text": "Fallback Show S02 1080p",
+        }
+        other_episode = {
+            "tmdb_id": 202,
+            "season": "S02",
+            "episode": "E08",
+            "text": "Fallback Show S02E08",
+        }
+
+        self.assertTrue(
+            self.plugin._calendar_download_matches(item, whole_season)
+        )
+        self.assertFalse(
+            self.plugin._calendar_download_matches(item, other_episode)
+        )
 
     def test_unified_request_uses_proxy_timeout_and_pagination_headers(self):
         self.module.requests.get = Mock(
@@ -553,6 +995,7 @@ class TraktSyncTest(unittest.TestCase):
     def test_cache_ttl_contracts_and_fresh_catalog_hit(self):
         self.assertEqual(6 * 3600, self.plugin._public_cache_ttl)
         self.assertEqual(15 * 60, self.plugin._personal_cache_ttl)
+        self.assertEqual(15 * 60, self.plugin._calendar_cache_ttl)
         self.assertEqual(3600, self.plugin._custom_list_catalog_ttl)
         self.plugin._get_account = Mock(
             return_value=(
@@ -579,6 +1022,71 @@ class TraktSyncTest(unittest.TestCase):
         self.assertFalse(cache_meta["stale"])
         self.plugin._fetch_all_pages.assert_not_called()
 
+    def test_personal_calendar_snapshot_ttl_force_and_account_isolation(self):
+        self.plugin._get_account = Mock(
+            return_value=({"uuid": "account-one"}, {"cached": True})
+        )
+        snapshot_key = self.plugin._calendar_snapshot_key(
+            "account-one", "shows", "2026-08-01", 14
+        )
+        other_key = self.plugin._calendar_snapshot_key(
+            "account-two", "shows", "2026-08-01", 14
+        )
+        self.assertNotEqual(snapshot_key, other_key)
+        self.store.data[snapshot_key] = {
+            "timestamp": time.time(),
+            "fetched_at": "fresh",
+            "data": [{"event_id": "cached", "moviepilot_state": "missing"}],
+            "cache": {"stale": False},
+            "status_meta": {"moviepilot_status_stale": False},
+        }
+        self.plugin._cached_request = Mock(
+            return_value={
+                "data": [_calendar_show_item()],
+                "pagination": {},
+                "cache": {"cached": False, "stale": False},
+            }
+        )
+        self.plugin._enrich_calendar_states = Mock(return_value=([], {}))
+
+        cached = self.plugin.get_trakt_calendar(
+            "my", "shows", "2026-08-01", 14
+        )
+        refreshed = self.plugin.get_trakt_calendar(
+            "my", "shows", "2026-08-01", 14, force_refresh=True
+        )
+
+        self.assertEqual("cached", cached["data"][0]["event_id"])
+        self.assertTrue(cached["meta"]["cached"])
+        self.assertEqual([], refreshed["data"])
+        self.plugin._cached_request.assert_called_once()
+
+    def test_personal_calendar_falls_back_to_stale_snapshot(self):
+        self.plugin._get_account = Mock(
+            return_value=({"uuid": "account-uuid"}, {"cached": True})
+        )
+        key = self.plugin._calendar_snapshot_key(
+            "account-uuid", "shows", "2026-08-01", 14
+        )
+        self.store.data[key] = {
+            "timestamp": time.time() - 9999,
+            "fetched_at": "old",
+            "data": [{"event_id": "old", "moviepilot_state": "subscribed"}],
+            "cache": {"stale": False},
+            "status_meta": {"moviepilot_status_stale": False},
+        }
+        self.plugin._cached_request = Mock(
+            side_effect=self.module.TraktRequestError("HTTP 500", status_code=500)
+        )
+
+        payload = self.plugin.get_trakt_calendar(
+            "my", "shows", "2026-08-01", 14
+        )
+
+        self.assertTrue(payload["success"])
+        self.assertTrue(payload["meta"]["stale"])
+        self.assertEqual("old", payload["data"][0]["event_id"])
+
     def test_account_switch_clears_personal_cache_selection_and_sync_state(self):
         self.store.data[self.plugin._account_key] = {
             "timestamp": 1,
@@ -590,6 +1098,14 @@ class TraktSyncTest(unittest.TestCase):
         self.store.data[self.plugin._selected_lists_key] = [7]
         catalog_key = self.plugin._custom_list_catalog_data_key("old-uuid")
         self.store.data[catalog_key] = {"data": []}
+        calendar_snapshot_key = self.plugin._calendar_snapshot_key(
+            "old-uuid", "shows", "2026-08-01", 14
+        )
+        calendar_page_key = self.plugin._calendar_page_data_key("old-uuid")
+        calendar_status_key = self.plugin._calendar_status_data_key("old-uuid")
+        self.store.data[calendar_snapshot_key] = {"data": []}
+        self.store.data[calendar_page_key] = {"data": []}
+        self.store.data[calendar_status_key] = {"state": "success"}
         self.plugin._trakt_request = Mock(
             return_value={
                 "data": {
@@ -608,6 +1124,9 @@ class TraktSyncTest(unittest.TestCase):
         self.assertNotIn(self.plugin._sync_state_key, self.store.data)
         self.assertNotIn(self.plugin._selected_lists_key, self.store.data)
         self.assertNotIn(catalog_key, self.store.data)
+        self.assertNotIn(calendar_snapshot_key, self.store.data)
+        self.assertNotIn(calendar_page_key, self.store.data)
+        self.assertNotIn(calendar_status_key, self.store.data)
 
     def test_token_expiry_uses_trakt_expires_in(self):
         created_at = 1_700_000_000
@@ -1222,6 +1741,149 @@ class TraktSyncTest(unittest.TestCase):
         )
         thread_class.return_value.start.assert_called_once_with()
 
+    def test_calendar_refresh_api_queues_background_task_and_releases_lock(self):
+        started = []
+
+        class _ImmediateThread:
+            def __init__(thread_self, target, kwargs, daemon):
+                thread_self.target = target
+                thread_self.kwargs = kwargs
+
+            def start(thread_self):
+                started.append(thread_self.kwargs)
+                thread_self.target(**thread_self.kwargs)
+
+        self.plugin.refresh_calendar_page = Mock(
+            side_effect=lambda force_refresh, lock_acquired: (
+                self.module._calendar_refresh_lock.release()
+                or {"success": True}
+            )
+        )
+        with (
+            patch.object(self.module, "Thread", _ImmediateThread),
+            patch.object(self.module.logger, "info") as log_info,
+        ):
+            response = self.plugin.api_calendar_refresh()
+
+        self.assertTrue(response.success)
+        self.assertEqual(
+            [{"force_refresh": True, "lock_acquired": True}],
+            started,
+        )
+        self.assertFalse(self.module._calendar_refresh_lock.locked())
+        self.assertTrue(
+            any("日历手动刷新已进入后台队列" in call.args[0] for call in log_info.call_args_list)
+        )
+
+    def test_calendar_refresh_api_rejects_concurrent_task(self):
+        self.module._calendar_refresh_lock.acquire()
+        try:
+            response = self.plugin.api_calendar_refresh()
+        finally:
+            self.module._calendar_refresh_lock.release()
+
+        self.assertFalse(response.success)
+        self.assertIn("正在刷新", response.message)
+
+    def test_calendar_refresh_keeps_old_page_on_stale_result(self):
+        self.store.data[self.plugin._account_key] = {
+            "data": {"uuid": "account-uuid"}
+        }
+        page_key = self.plugin._calendar_page_data_key("account-uuid")
+        self.store.data[page_key] = {"data": [{"event_id": "old"}]}
+        self.plugin._calendar_today = Mock(return_value="2026-08-01")
+        snapshot_key = self.plugin._calendar_snapshot_key(
+            "account-uuid", "shows", "2026-08-01", 14
+        )
+        self.store.data[snapshot_key] = {
+            "fetched_at": "old",
+            "data": [{"event_id": "stale"}],
+        }
+        self.plugin.get_trakt_calendar = Mock(
+            return_value={
+                "success": True,
+                "meta": {"stale": True},
+                "data": [{"event_id": "stale"}],
+            }
+        )
+
+        result = self.plugin.refresh_calendar_page(force_refresh=True)
+
+        self.assertTrue(result["success"])
+        self.assertEqual("stale", result["state"])
+        self.assertEqual([{"event_id": "old"}], self.store.data[page_key]["data"])
+        status = self.store.data[
+            self.plugin._calendar_status_data_key("account-uuid")
+        ]
+        self.assertEqual("stale", status["state"])
+
+    def test_calendar_refresh_logs_summary_without_credentials(self):
+        self.store.data[self.plugin._account_key] = {
+            "data": {"uuid": "account-uuid"}
+        }
+        self.store.data["token"] = _oauth_token("secret-access-token")
+        self.plugin._calendar_today = Mock(return_value="2026-08-01")
+        snapshot_key = self.plugin._calendar_snapshot_key(
+            "account-uuid", "shows", "2026-08-01", 14
+        )
+        self.store.data[snapshot_key] = {
+            "fetched_at": "now",
+            "data": [{"event_id": "episode"}],
+        }
+        self.plugin.get_trakt_calendar = Mock(
+            return_value={"success": True, "meta": {"stale": False}, "data": []}
+        )
+
+        with patch.object(self.module.logger, "info") as log_info:
+            result = self.plugin.refresh_calendar_page(force_refresh=True)
+
+        self.assertTrue(result["success"])
+        serialized = "\n".join(call.args[0] for call in log_info.call_args_list)
+        self.assertIn("条目=1", serialized)
+        self.assertNotIn("account-uuid", serialized)
+        self.assertNotIn("secret-access-token", serialized)
+
+    def test_calendar_has_independent_hourly_service(self):
+        self.plugin._enabled = True
+        self.plugin._cron = "*/15 * * * *"
+
+        services = self.plugin.get_service()
+        by_id = {service["id"]: service for service in services}
+
+        self.assertEqual({"TraktSync", "TraktSyncCalendar"}, set(by_id))
+        self.assertEqual({"hours": 1}, by_id["TraktSyncCalendar"]["kwargs"])
+        self.assertEqual(
+            self.plugin.refresh_calendar_page,
+            by_id["TraktSyncCalendar"]["func"],
+        )
+
+    def test_calendar_prefetch_runs_once_only_when_snapshot_missing(self):
+        started = []
+
+        class _ImmediateThread:
+            def __init__(thread_self, target, kwargs, daemon):
+                thread_self.target = target
+                thread_self.kwargs = kwargs
+
+            def start(thread_self):
+                started.append(thread_self.kwargs)
+                self.module._calendar_refresh_lock.release()
+
+        self.plugin._enabled = True
+        self.plugin.token = _oauth_token()
+        with patch.object(self.module, "Thread", _ImmediateThread):
+            self.plugin._start_calendar_prefetch_if_needed()
+
+        self.store.data[self.plugin._calendar_page_data_key()] = {"data": []}
+        with patch.object(self.module, "Thread", _ImmediateThread):
+            self.plugin._start_calendar_prefetch_if_needed()
+
+        self.assertEqual(
+            [{"force_refresh": False, "lock_acquired": True}],
+            started,
+        )
+        self.assertFalse(self.module._calendar_refresh_lock.locked())
+
     def test_legacy_subscription_identity_fallback_prevents_duplicate(self):
         media = _MediaInfo(tmdb_id=101)
         self.plugin.chain = types.SimpleNamespace(
@@ -1355,7 +2017,7 @@ class TraktSyncTest(unittest.TestCase):
         self.assertEqual([], self.store.data[self.plugin._selected_lists_key])
         self.assertIn("不会删除", deselected.message)
 
-    def test_three_mcp_tools_and_admin_declarations(self):
+    def test_four_mcp_tools_and_admin_declarations(self):
         tools = self.plugin.get_agent_tools()
         names = [tool.name for tool in tools]
 
@@ -1364,6 +2026,7 @@ class TraktSyncTest(unittest.TestCase):
                 "get_trakt_lists",
                 "get_trakt_personal_data",
                 "get_trakt_custom_lists",
+                "get_trakt_calendar",
             ],
             names,
         )
@@ -1372,6 +2035,10 @@ class TraktSyncTest(unittest.TestCase):
         self.assertFalse(
             hasattr(self.module.GetTraktListsTool, "require_admin")
             and self.module.GetTraktListsTool.require_admin
+        )
+        self.assertFalse(
+            hasattr(self.module.GetTraktCalendarTool, "require_admin")
+            and self.module.GetTraktCalendarTool.require_admin
         )
         source = (
             Path(__file__).parents[1]
@@ -1385,6 +2052,7 @@ class TraktSyncTest(unittest.TestCase):
         list_fields = self.module.GetTraktListsInput.__annotations__
         personal_fields = self.module.GetTraktPersonalDataInput.__annotations__
         custom_fields = self.module.GetTraktCustomListsInput.__annotations__
+        calendar_fields = self.module.GetTraktCalendarInput.__annotations__
 
         self.assertEqual(
             {
@@ -1414,6 +2082,19 @@ class TraktSyncTest(unittest.TestCase):
                 custom_fields
             )
         )
+        self.assertEqual(
+            {
+                "explanation",
+                "target",
+                "calendar_type",
+                "start_date",
+                "days",
+                "page",
+                "limit",
+                "force_refresh",
+            },
+            set(calendar_fields),
+        )
 
     def test_recommended_runtime_admin_gate_and_public_access(self):
         backend = types.SimpleNamespace(
@@ -1438,6 +2119,28 @@ class TraktSyncTest(unittest.TestCase):
         self.assertEqual("admin_required", denied["meta"]["error"]["code"])
         self.assertTrue(public["success"])
         backend.get_trakt_lists.assert_called_once()
+
+    def test_calendar_runtime_admin_gate_and_public_access(self):
+        backend = types.SimpleNamespace(
+            get_trakt_calendar=Mock(
+                return_value={"success": True, "meta": {}, "data": []}
+            )
+        )
+        tool = self.module.GetTraktCalendarTool(
+            session_id="session",
+            user_id="user",
+            plugin_instance=backend,
+        )
+
+        denied = json.loads(asyncio.run(tool.run(target="my")))
+        public = json.loads(
+            asyncio.run(tool.run(target="all", calendar_type="movies"))
+        )
+
+        self.assertFalse(denied["success"])
+        self.assertEqual("admin_required", denied["meta"]["error"]["code"])
+        self.assertTrue(public["success"])
+        backend.get_trakt_calendar.assert_called_once()
 
     def test_sensitive_fields_are_removed_recursively(self):
         payload = {
@@ -1464,6 +2167,17 @@ class TraktSyncTest(unittest.TestCase):
         ):
             self.assertNotIn(secret, serialized)
 
+    def test_safe_error_redacts_bearer_and_oauth_fields(self):
+        safe = self.plugin._safe_error(
+            "failed Authorization: Bearer abc.def access_token=one "
+            "refresh_token:two client_secret=three"
+        )
+
+        self.assertNotIn("abc.def", safe)
+        self.assertNotIn("one", safe)
+        self.assertNotIn("two", safe)
+        self.assertNotIn("three", safe)
+
     def test_page_reads_local_data_and_exposes_bearer_actions(self):
         self.store.data[self.plugin._account_key] = {
             "data": {
@@ -1475,6 +2189,31 @@ class TraktSyncTest(unittest.TestCase):
         self.store.data[self.plugin._sync_status_key] = {
             "state": "success",
             "message": "done",
+            "finished_at": "now",
+        }
+        normalized_calendar_item = self.plugin._normalize_calendar_item(
+            _calendar_show_item(first_aired="2026-08-01T12:00:00Z"),
+            "shows",
+        )
+        normalized_calendar_item.update(
+            {
+                "moviepilot_state": "subscribed",
+                "moviepilot_state_label": "已订阅",
+            }
+        )
+        self.store.data[
+            self.plugin._calendar_page_data_key("account-uuid")
+        ] = {
+            "fetched_at": "2026-08-01T00:00:00Z",
+            "start_date": "2026-08-01",
+            "days": 14,
+            "data": [normalized_calendar_item],
+        }
+        self.store.data[
+            self.plugin._calendar_status_data_key("account-uuid")
+        ] = {
+            "state": "success",
+            "message": "日历刷新完成",
             "finished_at": "now",
         }
         self.store.data[self.plugin._selected_lists_key] = [7]
@@ -1508,9 +2247,13 @@ class TraktSyncTest(unittest.TestCase):
         self.plugin._trakt_request.assert_not_called()
         self.assertIn("plugin/TraktSync/sync_now", serialized)
         self.assertIn("plugin/TraktSync/cache/refresh", serialized)
+        self.assertIn("plugin/TraktSync/calendar/refresh", serialized)
         self.assertIn("plugin/TraktSync/custom_lists/refresh", serialized)
         self.assertIn("plugin/TraktSync/custom_lists/select", serialized)
         self.assertIn("plugin/TraktSync/history/delete", serialized)
+        self.assertIn("个人剧集日历", serialized)
+        self.assertIn("S01E01", serialized)
+        self.assertIn("已订阅", serialized)
         self.assertNotIn("do-not-expose", serialized)
         self.assertNotIn("access_token", serialized)
 
@@ -1519,6 +2262,7 @@ class TraktSyncTest(unittest.TestCase):
         expected = {
             "/sync_now",
             "/cache/refresh",
+            "/calendar/refresh",
             "/custom_lists/refresh",
             "/custom_lists/select",
         }
@@ -1549,13 +2293,14 @@ class TraktSyncTest(unittest.TestCase):
             root / "plugins.v2" / "traktsync" / "README.md"
         ).read_text(encoding="utf-8")
 
-        self.assertEqual("0.5.2", self.module.TraktSync.plugin_version)
+        self.assertEqual("0.6.0", self.module.TraktSync.plugin_version)
         self.assertEqual(
             self.module.TraktSync.plugin_version,
             package["TraktSync"]["version"],
         )
-        self.assertIn("Trakt WatchList 同步 `v0.5.2`", readme)
+        self.assertIn("Trakt WatchList 同步 `v0.6.0`", readme)
         self.assertIn("get_trakt_lists", plugin_readme)
+        self.assertIn("get_trakt_calendar", plugin_readme)
 
 
 if __name__ == "__main__":
