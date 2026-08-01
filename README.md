@@ -15,7 +15,7 @@ MoviePilot插件市场：https://github.com/cyt-666/MoviePilot-Plugins
 
 ---
 
-### Trakt WatchList 同步 `v0.6.0`
+### Trakt WatchList 同步 `v0.6.1`
 
 Trakt 观看列表、自定义列表订阅同步、完整榜单和个人播出日历插件。
 

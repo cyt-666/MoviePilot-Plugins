@@ -371,7 +371,7 @@ class TraktSync(_PluginBase):
     plugin_desc = "同步 Trakt Watchlist 和自定义列表，并提供榜单、个人数据及日历 MCP 查询"
     plugin_icon = "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/trakt.png"
     plugin_author = "cyt-666"
-    plugin_version = "0.6.0"
+    plugin_version = "0.6.1"
     author_url = "https://github.com/cyt-666/MoviePilot-Plugins"
     plugin_config_prefix = "traktsync_"
     plugin_order = 3
@@ -768,7 +768,10 @@ class TraktSync(_PluginBase):
         refresh_status = self.get_data(
             self._calendar_status_data_key(account_uuid)
         ) or {}
-        items = page_record.get("data") or []
+        items = [
+            self._calendar_item_with_normalized_poster(item)
+            for item in (page_record.get("data") or [])
+        ]
         start_date = page_record.get("start_date")
         days = int(page_record.get("days") or 14)
         fetched_at = page_record.get("fetched_at") or "-"
@@ -2259,27 +2262,56 @@ class TraktSync(_PluginBase):
         return local_value.date().isoformat(), local_value.strftime("%H:%M")
 
     @staticmethod
-    def _first_image_url(images: Any) -> Optional[str]:
-        """兼容 Trakt 图片数组以及历史字典结构。"""
+    def _normalize_image_url(value: Any) -> Optional[str]:
+        """将 Trakt 省略协议的 CDN 图片地址转换为浏览器可加载的 URL。"""
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip()
+        if not normalized:
+            return None
+        if re.match(r"^https?://", normalized, flags=re.IGNORECASE):
+            return normalized
+        if normalized.startswith("//"):
+            return f"https:{normalized}"
+        if normalized.startswith(("/", "./", "../")):
+            return normalized
+        if re.match(r"^[a-z][a-z0-9+.-]*:", normalized, flags=re.IGNORECASE):
+            return None
+        return f"https://{normalized}"
+
+    @classmethod
+    def _first_image_url(cls, images: Any) -> Optional[str]:
+        """兼容 Trakt 图片数组以及历史字典结构，并补全 CDN URL。"""
         if isinstance(images, str):
-            value = images.strip()
-            return value or None
+            return cls._normalize_image_url(images)
         if isinstance(images, list):
             for item in images:
-                resolved = TraktSync._first_image_url(item)
+                resolved = cls._first_image_url(item)
                 if resolved:
                     return resolved
             return None
         if isinstance(images, dict):
             for key in ("poster", "thumb", "fanart", "banner", "screenshot"):
-                resolved = TraktSync._first_image_url(images.get(key))
+                resolved = cls._first_image_url(images.get(key))
                 if resolved:
                     return resolved
             for key in ("full", "medium", "thumb"):
-                resolved = TraktSync._first_image_url(images.get(key))
+                resolved = cls._first_image_url(images.get(key))
                 if resolved:
                     return resolved
         return None
+
+    def _calendar_item_with_normalized_poster(self, item: Any) -> dict:
+        """兼容升级前已保存的无协议日历海报地址。"""
+        result = dict(item) if isinstance(item, dict) else {}
+        if "poster" not in result:
+            return result
+        poster = self._normalize_image_url(result.get("poster"))
+        if poster:
+            result["poster"] = poster
+        else:
+            result.pop("poster", None)
+        return result
 
     @staticmethod
     def _calendar_event_id(*parts: Any) -> str:
@@ -2830,6 +2862,10 @@ class TraktSync(_PluginBase):
                     else:
                         raise
 
+            all_data = [
+                self._calendar_item_with_normalized_poster(item)
+                for item in all_data
+            ]
             start = (page - 1) * limit
             page_data = all_data[start : start + limit]
             meta = {

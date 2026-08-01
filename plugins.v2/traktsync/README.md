@@ -2,6 +2,8 @@
 
 TraktSync 将单一管理员 Trakt 账户的 Watchlist 和已选择的个人列表作为 MoviePilot 订阅来源，并提供只读榜单、个人数据与播出日历 MCP 工具。
 
+当前版本为 `0.6.1`。日历会自动为 Trakt 返回的无协议 CDN 图片地址补全 HTTPS，并兼容升级前保存的日历快照。
+
 接口语义以 Trakt 当前官方契约为准：[Sync](https://github.com/trakt/trakt-api/blob/master/projects/api/src/contracts/sync/index.ts)、[电影](https://github.com/trakt/trakt-api/blob/master/projects/api/src/contracts/movies/index.ts)、[剧集](https://github.com/trakt/trakt-api/blob/master/projects/api/src/contracts/shows/index.ts)、[日历](https://github.com/trakt/trakt-api/blob/master/projects/api/src/contracts/calendars/index.ts) 和 [个人列表](https://github.com/trakt/trakt-api/blob/master/projects/api/src/contracts/users/subroutes/userLists.ts)。
 
 ## 同步行为
