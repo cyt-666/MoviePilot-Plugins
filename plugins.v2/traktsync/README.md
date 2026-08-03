@@ -1,8 +1,8 @@
 # TraktSync
 
-TraktSync 将单一管理员 Trakt 账户的 Watchlist 和已选择的个人列表作为 MoviePilot 订阅来源，并提供只读榜单、个人数据与播出日历 MCP 工具。
+TraktSync 将单一管理员 Trakt 账户的 Watchlist 和已选择的个人列表作为 MoviePilot 订阅来源，并提供榜单、个人数据、播出日历及安全写入 MCP 工具。
 
-当前版本为 `0.6.1`。日历会自动为 Trakt 返回的无协议 CDN 图片地址补全 HTTPS，并兼容升级前保存的日历快照。
+当前版本为 `0.7.0`。管理员可以通过 MCP 修改 Trakt Watchlist、创建个人列表，以及添加或移除列表条目。
 
 接口语义以 Trakt 当前官方契约为准：[Sync](https://github.com/trakt/trakt-api/blob/master/projects/api/src/contracts/sync/index.ts)、[电影](https://github.com/trakt/trakt-api/blob/master/projects/api/src/contracts/movies/index.ts)、[剧集](https://github.com/trakt/trakt-api/blob/master/projects/api/src/contracts/shows/index.ts)、[日历](https://github.com/trakt/trakt-api/blob/master/projects/api/src/contracts/calendars/index.ts) 和 [个人列表](https://github.com/trakt/trakt-api/blob/master/projects/api/src/contracts/users/subroutes/userLists.ts)。
 
@@ -19,12 +19,32 @@ TraktSync 将单一管理员 Trakt 账户的 Watchlist 和已选择的个人列�
 
 ## MCP 工具
 
+### 查询工具
+
 - `get_trakt_lists`：公开查询 popular、trending、anticipated、watched、collected 和电影 boxoffice；recommended 需要管理员身份与 OAuth。
 - `get_trakt_personal_data`：管理员查询 watchlist、collection、history、up_next 和 stats。
 - `get_trakt_custom_lists`：管理员查询个人列表目录及 movie、show、season、episode 条目，并显示 `selected_for_sync`。
 - `get_trakt_calendar`：查询 `my` 或 `all` 的 shows、movies、new_shows、season_premieres、finales 和 dvd 日历。公开日历允许普通 Agent 查询；个人日历要求管理员和 OAuth。个人剧集结果附带 MoviePilot 逐集状态。
 
-四个工具统一返回：
+### 写入工具
+
+- `manage_trakt_watchlist`：向当前 OAuth 账户的 Watchlist 添加条目，或从中移除条目。
+- `manage_trakt_custom_lists`：创建个人列表，或添加、移除列表条目。创建列表时可以同时添加条目；如果第二步失败，插件会保留并返回已创建的列表。
+
+两个写入工具均要求管理员身份，并带有 MoviePilot 的 `write`、`admin` 和 `media` 标签。MoviePilot MCP 关闭写操作或未授予写权限时，不会向客户端暴露这些工具。
+
+每次写入最多包含 100 个条目。单次调用可以混合电影、剧集、季度和单集。条目按媒体类型与 ID 组合去重，并支持以下 ID：
+
+| 媒体类型 | Trakt | TMDB | IMDb | TVDB |
+| --- | --- | --- | --- | --- |
+| 电影 | 支持 | 支持 | 支持 | 不支持 |
+| 剧集 | 支持 | 支持 | 支持 | 支持 |
+| 季度 | 支持 | 支持 | 不支持 | 支持 |
+| 单集 | 支持 | 不支持 | 不支持 | 支持 |
+
+上述范围与 Trakt 当前请求契约一致。每个条目至少提供一种受支持的 ID。
+
+六个工具统一返回：
 
 ```json
 {
@@ -38,7 +58,18 @@ TraktSync 将单一管理员 Trakt 账户的 Watchlist 和已选择的个人列�
 }
 ```
 
-响应不会包含 OAuth Token、邮箱、Client Secret 或 Authorization 请求头。
+响应不会包含 OAuth Token、邮箱、账户 UUID、Client Secret 或 Authorization 请求头。
+
+写入响应的 `meta` 会提供请求数量、去重后数量、实际变更数量、已存在数量、未找到数量和部分成功状态。Trakt 返回 `existing` 时，插件按幂等成功处理；返回 `not_found` 时，`success` 为 `false`，已有部分条目完成时同时返回 `partial=true`。
+
+## 写入与同步
+
+- 写入只修改当前管理员 OAuth 账户，不接受外部用户名或账户标识。
+- 写入成功后，插件只清理当前账户中受影响的 Watchlist、Up Next、个人列表目录或列表条目缓存。
+- 写入不会修改 `last_activities`、来源同步状态或列表选择，也不会立即创建 MoviePilot 订阅。
+- 已启用的 Watchlist 和已选择的个人列表仍按原周期同步。用户也可以在详情页点击“立即同步”。
+- 创建的新列表默认不选为同步来源。需要订阅其中的电影或整剧时，请在插件详情页手动选择。
+- 写请求仅在 OAuth 返回 401 时刷新 Token 并重试一次。429、420、5xx 和网络错误不会自动重试。
 
 ## 缓存
 
