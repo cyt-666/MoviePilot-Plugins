@@ -37,13 +37,14 @@
     },
     "TraktSync": {
         "name": "Trakt WatchList 同步",
-        "description": "同步 Trakt Watchlist 和自定义列表，并提供完整榜单、个人数据与播出日历 MCP 查询",
-        "labels": "Trakt,WatchList,自定义列表,同步,推荐,榜单,日历,MCP",
-        "version": "0.6.1",
+        "description": "同步 Trakt Watchlist 和自定义列表，并提供榜单、个人数据、播出日历及安全写入 MCP 工具",
+        "labels": "Trakt,WatchList,自定义列表,同步,推荐,榜单,日历,写入,MCP",
+        "version": "0.7.0",
         "icon": "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/trakt.png",
         "author": "cyt-666",
         "level": 2,
         "history": {
+            "v0.7.0": "新增 Trakt 写入 MCP 能力：管理员可批量添加或移除 Watchlist 条目、创建个人列表，并添加或移除列表条目；支持电影、剧集、季度和单集混合批量及多种媒体 ID，写工具接入 MoviePilot 写操作门禁，成功后仅定向清理相关缓存，不会立即触发订阅同步。",
             "v0.6.1": "修复日历封面无法加载的问题：为 Trakt 返回的无协议 CDN 图片地址自动补全 HTTPS，并兼容升级前已保存的日历快照。",
             "v0.6.0": "新增 Trakt 播出日历：详情页按天展示未来 14 天个人剧集，并结合 MoviePilot 媒体库、下载任务和订阅计算六种逐集状态；新增 get_trakt_calendar MCP 工具覆盖个人与公开剧集、电影、首播、季终和 DVD 日历，支持账户隔离缓存、陈旧回退、手动及每小时后台刷新。",
             "v0.5.2": "补充立即同步可观测日志：记录任务入队、同步模式、来源统计、来源跳过、新增订阅、失败原因及最终汇总，且不输出账户 UUID、Token 或请求头。",

@@ -45,6 +45,12 @@ class _MoviePilotTool:
         return bool(self._agent_context.get("is_admin"))
 
 
+class _ToolTag:
+    Write = "write"
+    Admin = "admin"
+    Media = "media"
+
+
 class _EventManager:
     @staticmethod
     def register(*args, **kwargs):
@@ -164,6 +170,7 @@ def _load_plugin_module_with_stubs():
     _install_module("app.agent")
     _install_module("app.agent.tools")
     _install_module("app.agent.tools.base", MoviePilotTool=_MoviePilotTool)
+    _install_module("app.agent.tools.tags", ToolTag=_ToolTag)
 
     settings = types.SimpleNamespace(
         PROXY={"https": "http://proxy.invalid"},
@@ -2041,7 +2048,7 @@ class TraktSyncTest(unittest.TestCase):
         self.assertEqual([], self.store.data[self.plugin._selected_lists_key])
         self.assertIn("不会删除", deselected.message)
 
-    def test_four_mcp_tools_and_admin_declarations(self):
+    def test_six_mcp_tools_and_write_declarations(self):
         tools = self.plugin.get_agent_tools()
         names = [tool.name for tool in tools]
 
@@ -2051,11 +2058,24 @@ class TraktSyncTest(unittest.TestCase):
                 "get_trakt_personal_data",
                 "get_trakt_custom_lists",
                 "get_trakt_calendar",
+                "manage_trakt_watchlist",
+                "manage_trakt_custom_lists",
             ],
             names,
         )
         self.assertTrue(self.module.GetTraktPersonalDataTool.require_admin)
         self.assertTrue(self.module.GetTraktCustomListsTool.require_admin)
+        self.assertTrue(self.module.ManageTraktWatchlistTool.require_admin)
+        self.assertTrue(self.module.ManageTraktCustomListsTool.require_admin)
+        expected_write_tags = {"write", "admin", "media"}
+        self.assertEqual(
+            expected_write_tags,
+            set(self.module.ManageTraktWatchlistTool.tags),
+        )
+        self.assertEqual(
+            expected_write_tags,
+            set(self.module.ManageTraktCustomListsTool.tags),
+        )
         self.assertFalse(
             hasattr(self.module.GetTraktListsTool, "require_admin")
             and self.module.GetTraktListsTool.require_admin
@@ -2077,6 +2097,13 @@ class TraktSyncTest(unittest.TestCase):
         personal_fields = self.module.GetTraktPersonalDataInput.__annotations__
         custom_fields = self.module.GetTraktCustomListsInput.__annotations__
         calendar_fields = self.module.GetTraktCalendarInput.__annotations__
+        write_item_fields = self.module.TraktWriteItem.__annotations__
+        watchlist_write_fields = (
+            self.module.ManageTraktWatchlistInput.__annotations__
+        )
+        custom_write_fields = (
+            self.module.ManageTraktCustomListsInput.__annotations__
+        )
 
         self.assertEqual(
             {
@@ -2118,6 +2145,28 @@ class TraktSyncTest(unittest.TestCase):
                 "force_refresh",
             },
             set(calendar_fields),
+        )
+        self.assertEqual(
+            {"media_type", "trakt_id", "tmdb_id", "imdb_id", "tvdb_id"},
+            set(write_item_fields),
+        )
+        self.assertEqual(
+            {"explanation", "action", "items"},
+            set(watchlist_write_fields),
+        )
+        self.assertEqual(
+            {
+                "explanation",
+                "action",
+                "list_id",
+                "name",
+                "description",
+                "privacy",
+                "display_numbers",
+                "allow_comments",
+                "items",
+            },
+            set(custom_write_fields),
         )
 
     def test_recommended_runtime_admin_gate_and_public_access(self):
@@ -2166,12 +2215,526 @@ class TraktSyncTest(unittest.TestCase):
         self.assertTrue(public["success"])
         backend.get_trakt_calendar.assert_called_once()
 
+    def test_write_body_supports_mixed_ids_and_stable_deduplication(self):
+        items = [
+            {
+                "media_type": "movie",
+                "trakt_id": 1,
+                "tmdb_id": 101,
+                "imdb_id": "tt0000001",
+            },
+            {
+                "media_type": "movie",
+                "trakt_id": 1,
+                "tmdb_id": 101,
+                "imdb_id": "tt0000001",
+            },
+            {"media_type": "show", "tvdb_id": 202},
+            {"media_type": "season", "tmdb_id": 303},
+            {"media_type": "episode", "tvdb_id": 404},
+        ]
+
+        body, requested_count, unique_count = self.plugin._build_write_body(items)
+
+        self.assertEqual(5, requested_count)
+        self.assertEqual(4, unique_count)
+        self.assertEqual(
+            {
+                "movies": [
+                    {
+                        "ids": {
+                            "trakt": 1,
+                            "tmdb": 101,
+                            "imdb": "tt0000001",
+                        }
+                    }
+                ],
+                "shows": [{"ids": {"tvdb": 202}}],
+                "seasons": [{"ids": {"tmdb": "303"}}],
+                "episodes": [{"ids": {"tvdb": 404}}],
+            },
+            body,
+        )
+
+    def test_write_body_rejects_invalid_or_unsupported_items(self):
+        invalid_cases = [
+            [],
+            [{"media_type": "movie"}],
+            [{"media_type": "invalid", "trakt_id": 1}],
+            [{"media_type": "movie", "tvdb_id": 1}],
+            [{"media_type": "season", "imdb_id": "tt1"}],
+            [{"media_type": "episode", "tmdb_id": 1}],
+            [{"media_type": "show", "trakt_id": 0}],
+            [{"media_type": "show", "imdb_id": "   "}],
+            [{"media_type": "show", "imdb_id": 123}],
+            [{"media_type": "movie", "trakt_id": 1}] * 101,
+        ]
+
+        for items in invalid_cases:
+            with self.subTest(items_count=len(items)):
+                with self.assertRaises(ValueError):
+                    self.plugin._build_write_body(items)
+
+    def test_watchlist_write_posts_mixed_body_and_invalidates_targeted_cache(self):
+        account_uuid = "account-uuid"
+        self.plugin._get_account = Mock(
+            return_value=(
+                {"uuid": account_uuid, "slug": "tester"},
+                {"cached": False, "stale": False},
+            )
+        )
+        watchlist_key = self.plugin._cache_key(
+            "personal",
+            account_uuid,
+            "personal:watchlist:all",
+            "/sync/watchlist/all/rank/asc",
+            {},
+        )
+        up_next_key = self.plugin._cache_key(
+            "personal",
+            account_uuid,
+            "personal:up_next:all",
+            "/sync/progress/up_next",
+            {},
+        )
+        history_key = self.plugin._cache_key(
+            "personal",
+            account_uuid,
+            "personal:history:all",
+            "/sync/history",
+            {},
+        )
+        other_account_key = self.plugin._cache_key(
+            "personal",
+            "other-account",
+            "personal:watchlist:all",
+            "/sync/watchlist/all/rank/asc",
+            {},
+        )
+        for key, uuid, path in (
+            (watchlist_key, account_uuid, "/sync/watchlist/all/rank/asc"),
+            (up_next_key, account_uuid, "/sync/progress/up_next"),
+            (history_key, account_uuid, "/sync/history"),
+            (other_account_key, "other-account", "/sync/watchlist/all/rank/asc"),
+        ):
+            self.store.data[key] = {
+                "account_uuid": uuid,
+                "path": path,
+                "namespace": "personal",
+                "data": [],
+            }
+        sync_state = {"account_uuid": account_uuid, "sources": {"old": {}}}
+        self.store.data[self.plugin._sync_state_key] = sync_state
+        self.plugin.sync_watchlist = Mock()
+        self.plugin._trakt_request = Mock(
+            return_value={
+                "status_code": 201,
+                "data": {
+                    "added": {"movies": 1},
+                    "existing": {},
+                    "not_found": {"shows": [{"ids": {"trakt": 2}}]},
+                    "diagnostic": {
+                        "authorization": "Bearer secret",
+                        "email": "private@example.com",
+                        "account_uuid": "private-account-uuid",
+                    },
+                },
+            }
+        )
+
+        result = self.plugin.manage_trakt_watchlist(
+            "add",
+            [
+                {"media_type": "movie", "trakt_id": 1},
+                {"media_type": "show", "trakt_id": 2},
+            ],
+        )
+
+        self.assertFalse(result["success"])
+        self.assertTrue(result["meta"]["partial"])
+        self.assertEqual(1, result["meta"]["affected_count"])
+        self.assertEqual(1, result["meta"]["not_found_count"])
+        self.assertEqual("items_not_found", result["meta"]["error"]["code"])
+        self.assertEqual(2, result["meta"]["cache_invalidated"])
+        request = self.plugin._trakt_request.call_args
+        self.assertEqual("/sync/watchlist", request.args[0])
+        self.assertEqual("POST", request.kwargs["method"])
+        self.assertTrue(request.kwargs["requires_auth"])
+        self.assertEqual(
+            {
+                "movies": [{"ids": {"trakt": 1}}],
+                "shows": [{"ids": {"trakt": 2}}],
+            },
+            request.kwargs["json_body"],
+        )
+        self.assertNotIn(watchlist_key, self.store.data)
+        self.assertNotIn(up_next_key, self.store.data)
+        self.assertIn(history_key, self.store.data)
+        self.assertIn(other_account_key, self.store.data)
+        self.assertEqual(sync_state, self.store.data[self.plugin._sync_state_key])
+        self.plugin.sync_watchlist.assert_not_called()
+        serialized = json.dumps(result)
+        self.assertNotIn("Bearer secret", serialized)
+        self.assertNotIn("private@example.com", serialized)
+        self.assertNotIn("private-account-uuid", serialized)
+
+    def test_watchlist_remove_and_conflict_add_are_idempotent(self):
+        self.plugin._get_account = Mock(
+            return_value=(
+                {"uuid": "account-uuid", "slug": "tester"},
+                {"cached": False, "stale": False},
+            )
+        )
+        self.plugin._trakt_request = Mock(
+            return_value={
+                "status_code": 200,
+                "data": {"removed": {"episodes": 1}, "not_found": {}},
+            }
+        )
+
+        removed = self.plugin.manage_trakt_watchlist(
+            "remove",
+            [{"media_type": "episode", "trakt_id": 9}],
+        )
+
+        self.assertTrue(removed["success"])
+        self.assertEqual(1, removed["meta"]["affected_count"])
+        self.assertEqual(
+            "/sync/watchlist/remove",
+            self.plugin._trakt_request.call_args.args[0],
+        )
+
+        self.plugin._trakt_request = Mock(
+            side_effect=self.module.TraktRequestError(
+                "HTTP 409 response body must not leak",
+                status_code=409,
+            )
+        )
+        existing = self.plugin.manage_trakt_watchlist(
+            "add",
+            [{"media_type": "movie", "tmdb_id": 10}],
+        )
+
+        self.assertTrue(existing["success"])
+        self.assertTrue(existing["meta"]["idempotent"])
+        self.assertEqual(1, existing["meta"]["existing_count"])
+        self.plugin._trakt_request.assert_called_once()
+
+    def test_watchlist_write_errors_are_structured_and_not_retried(self):
+        self.plugin._get_account = Mock(
+            return_value=(
+                {"uuid": "account-uuid", "slug": "tester"},
+                {"cached": False, "stale": False},
+            )
+        )
+        cases = {
+            401: "oauth_required",
+            403: "forbidden",
+            404: "not_found",
+            409: "conflict",
+            420: "limit_exceeded",
+            422: "invalid_request",
+            429: "rate_limited",
+            500: "trakt_server_error",
+        }
+        for status_code, error_code in cases.items():
+            with self.subTest(status_code=status_code):
+                self.plugin._trakt_request = Mock(
+                    side_effect=self.module.TraktRequestError(
+                        "Authorization: Bearer secret access_token=secret",
+                        status_code=status_code,
+                    )
+                )
+                logger = Mock()
+                with patch.object(self.module, "logger", logger):
+                    result = self.plugin.manage_trakt_watchlist(
+                        "remove",
+                        [{"media_type": "movie", "trakt_id": 987654}],
+                    )
+                self.assertFalse(result["success"])
+                self.assertEqual(error_code, result["meta"]["error"]["code"])
+                self.plugin._trakt_request.assert_called_once()
+                logged = str(logger.method_calls)
+                self.assertNotIn("987654", logged)
+                self.assertNotIn("Bearer secret", logged)
+                self.assertNotIn("access_token", logged)
+
+    def test_write_refuses_stale_account_identity(self):
+        self.plugin._get_account = Mock(
+            return_value=(
+                {"uuid": "old-account", "slug": "old-user"},
+                {"cached": True, "stale": True},
+            )
+        )
+        self.plugin._trakt_request = Mock()
+
+        result = self.plugin.manage_trakt_watchlist(
+            "add",
+            [{"media_type": "movie", "trakt_id": 1}],
+        )
+
+        self.assertFalse(result["success"])
+        self.assertEqual(
+            "trakt_request_failed",
+            result["meta"]["error"]["code"],
+        )
+        self.plugin._get_account.assert_called_once_with(force_refresh=True)
+        self.plugin._trakt_request.assert_not_called()
+
+    def test_post_request_refreshes_oauth_once_and_preserves_write_body(self):
+        self.store.data["token"] = _oauth_token("old-token")
+        self.module.requests.post = Mock(
+            side_effect=[
+                _Response(401, {}),
+                _Response(201, {"added": {"movies": 1}}),
+            ]
+        )
+
+        def refresh(_):
+            token = _oauth_token("new-token")
+            self.store.data["token"] = token
+            return token
+
+        self.plugin.refresh_token_request = Mock(side_effect=refresh)
+        body = {"movies": [{"ids": {"trakt": 1}}]}
+
+        result = self.plugin._trakt_request(
+            "/sync/watchlist",
+            method="POST",
+            json_body=body,
+            requires_auth=True,
+        )
+
+        self.assertEqual(201, result["status_code"])
+        self.assertEqual(2, self.module.requests.post.call_count)
+        self.plugin.refresh_token_request.assert_called_once_with("refresh-token")
+        calls = self.module.requests.post.call_args_list
+        self.assertEqual(body, calls[0].kwargs["json"])
+        self.assertEqual(body, calls[1].kwargs["json"])
+        self.assertEqual("Bearer old-token", calls[0].kwargs["headers"]["Authorization"])
+        self.assertEqual("Bearer new-token", calls[1].kwargs["headers"]["Authorization"])
+        self.assertEqual({"https": "http://proxy.invalid"}, calls[0].kwargs["proxies"])
+        self.assertEqual((10, 30), calls[0].kwargs["timeout"])
+
+    def test_post_request_does_not_retry_rate_limit_or_server_errors(self):
+        self.store.data["token"] = _oauth_token()
+        for status_code in (420, 429, 500):
+            with self.subTest(status_code=status_code):
+                self.module.requests.post = Mock(
+                    return_value=_Response(status_code, {"error": "sensitive"})
+                )
+                with self.assertRaises(self.module.TraktRequestError) as raised:
+                    self.plugin._trakt_request(
+                        "/sync/watchlist",
+                        method="POST",
+                        json_body={"movies": [{"ids": {"trakt": 1}}]},
+                        requires_auth=True,
+                    )
+                self.assertEqual(status_code, raised.exception.status_code)
+                self.module.requests.post.assert_called_once()
+
+    def test_create_custom_list_can_add_items_without_selecting_or_syncing(self):
+        account_uuid = "account-uuid"
+        self.plugin._get_account = Mock(
+            return_value=(
+                {"uuid": account_uuid, "slug": "tester"},
+                {"cached": False, "stale": False},
+            )
+        )
+        catalog_key = self.plugin._custom_list_catalog_data_key(account_uuid)
+        self.store.data[catalog_key] = {
+            "account_uuid": account_uuid,
+            "data": [{"list_id": 99}],
+        }
+        list_item_key = self.plugin._cache_key(
+            "personal",
+            account_uuid,
+            "custom-list:7:all",
+            "/users/tester/lists/7/items/movie,show,season,episode",
+            {},
+        )
+        other_list_key = self.plugin._cache_key(
+            "personal",
+            account_uuid,
+            "custom-list:8:all",
+            "/users/tester/lists/8/items/movie,show,season,episode",
+            {},
+        )
+        for key, path in (
+            (
+                list_item_key,
+                "/users/tester/lists/7/items/movie,show,season,episode",
+            ),
+            (
+                other_list_key,
+                "/users/tester/lists/8/items/movie,show,season,episode",
+            ),
+        ):
+            self.store.data[key] = {
+                "account_uuid": account_uuid,
+                "path": path,
+                "namespace": "custom-list",
+                "data": [],
+            }
+        self.store.data[self.plugin._selected_lists_key] = [99]
+        self.store.data[self.plugin._sync_state_key] = {"sources": {"old": {}}}
+        self.plugin.sync_watchlist = Mock()
+        self.plugin._trakt_request = Mock(
+            side_effect=[
+                {
+                    "status_code": 201,
+                    "data": {
+                        "name": "My List",
+                        "description": "Description",
+                        "privacy": "link",
+                        "display_numbers": True,
+                        "allow_comments": False,
+                        "ids": {"trakt": 7, "slug": "my-list"},
+                    },
+                },
+                {
+                    "status_code": 201,
+                    "data": {
+                        "added": {"movies": 1, "episodes": 1},
+                        "existing": {},
+                        "not_found": {},
+                    },
+                },
+            ]
+        )
+
+        result = self.plugin.manage_trakt_custom_lists(
+            "create",
+            name="  My List  ",
+            description="  Description  ",
+            privacy="link",
+            display_numbers=True,
+            allow_comments=False,
+            items=[
+                {"media_type": "movie", "trakt_id": 1},
+                {"media_type": "episode", "tvdb_id": 2},
+            ],
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(7, result["data"]["created_list"]["list_id"])
+        self.assertFalse(result["data"]["created_list"]["selected_for_sync"])
+        self.assertEqual(3, result["meta"]["affected_count"])
+        calls = self.plugin._trakt_request.call_args_list
+        self.assertEqual("/users/tester/lists", calls[0].args[0])
+        self.assertEqual(
+            {
+                "name": "My List",
+                "description": "Description",
+                "privacy": "link",
+                "display_numbers": True,
+                "allow_comments": False,
+            },
+            calls[0].kwargs["json_body"],
+        )
+        self.assertEqual("/users/tester/lists/7/items", calls[1].args[0])
+        self.assertEqual(
+            {
+                "movies": [{"ids": {"trakt": 1}}],
+                "episodes": [{"ids": {"tvdb": 2}}],
+            },
+            calls[1].kwargs["json_body"],
+        )
+        self.assertNotIn(catalog_key, self.store.data)
+        self.assertNotIn(list_item_key, self.store.data)
+        self.assertIn(other_list_key, self.store.data)
+        self.assertEqual([99], self.store.data[self.plugin._selected_lists_key])
+        self.assertIn(self.plugin._sync_state_key, self.store.data)
+        self.plugin.sync_watchlist.assert_not_called()
+
+    def test_create_custom_list_preserves_list_when_item_add_fails(self):
+        self.plugin._get_account = Mock(
+            return_value=(
+                {"uuid": "account-uuid", "slug": "tester"},
+                {"cached": False, "stale": False},
+            )
+        )
+        self.plugin._trakt_request = Mock(
+            side_effect=[
+                {
+                    "status_code": 201,
+                    "data": {
+                        "name": "Created",
+                        "ids": {"trakt": 8},
+                    },
+                },
+                self.module.TraktRequestError("HTTP 500", status_code=500),
+            ]
+        )
+
+        result = self.plugin.manage_trakt_custom_lists(
+            "create",
+            name="Created",
+            items=[{"media_type": "show", "trakt_id": 2}],
+        )
+
+        self.assertFalse(result["success"])
+        self.assertTrue(result["meta"]["partial"])
+        self.assertEqual("trakt_server_error", result["meta"]["error"]["code"])
+        self.assertEqual(8, result["data"]["created_list"]["list_id"])
+        self.assertEqual(2, self.plugin._trakt_request.call_count)
+        for call in self.plugin._trakt_request.call_args_list:
+            self.assertEqual("POST", call.kwargs["method"])
+
+    def test_custom_list_create_empty_and_item_endpoints(self):
+        self.plugin._get_account = Mock(
+            return_value=(
+                {"uuid": "account-uuid", "slug": "tester"},
+                {"cached": False, "stale": False},
+            )
+        )
+        self.plugin._trakt_request = Mock(
+            return_value={
+                "status_code": 201,
+                "data": {"name": "Empty", "ids": {"trakt": 10}},
+            }
+        )
+
+        empty = self.plugin.manage_trakt_custom_lists("create", name="Empty")
+
+        self.assertTrue(empty["success"])
+        self.assertEqual(1, empty["meta"]["affected_count"])
+        self.plugin._trakt_request.assert_called_once()
+
+        cases = (
+            (
+                "add_items",
+                "/users/tester/lists/10/items",
+                {"added": {}, "existing": {"shows": 1}, "not_found": {}},
+            ),
+            (
+                "remove_items",
+                "/users/tester/lists/10/items/remove",
+                {"removed": {"shows": 1}, "not_found": {}},
+            ),
+        )
+        for action, endpoint, data in cases:
+            with self.subTest(action=action):
+                self.plugin._trakt_request = Mock(
+                    return_value={"status_code": 200, "data": data}
+                )
+                result = self.plugin.manage_trakt_custom_lists(
+                    action,
+                    list_id=10,
+                    items=[{"media_type": "show", "tvdb_id": 20}],
+                )
+                self.assertTrue(result["success"])
+                self.assertEqual(endpoint, self.plugin._trakt_request.call_args.args[0])
+                self.plugin._trakt_request.assert_called_once()
+
     def test_sensitive_fields_are_removed_recursively(self):
         payload = {
             "access_token": "access",
             "refresh_token": "refresh",
             "client_secret": "client-secret",
             "email": "mail@example.com",
+            "uuid": "account-uuid",
+            "account_uuid": "account-uuid-2",
             "nested": {
                 "authorization": "Bearer secret",
                 "name": "safe",
@@ -2187,6 +2750,8 @@ class TraktSyncTest(unittest.TestCase):
             "refresh",
             "client-secret",
             "mail@example.com",
+            "account-uuid",
+            "account-uuid-2",
             "Bearer secret",
         ):
             self.assertNotIn(secret, serialized)
@@ -2318,14 +2883,16 @@ class TraktSyncTest(unittest.TestCase):
             root / "plugins.v2" / "traktsync" / "README.md"
         ).read_text(encoding="utf-8")
 
-        self.assertEqual("0.6.1", self.module.TraktSync.plugin_version)
+        self.assertEqual("0.7.0", self.module.TraktSync.plugin_version)
         self.assertEqual(
             self.module.TraktSync.plugin_version,
             package["TraktSync"]["version"],
         )
-        self.assertIn("Trakt WatchList 同步 `v0.6.1`", readme)
+        self.assertIn("Trakt WatchList 同步 `v0.7.0`", readme)
         self.assertIn("get_trakt_lists", plugin_readme)
         self.assertIn("get_trakt_calendar", plugin_readme)
+        self.assertIn("manage_trakt_watchlist", plugin_readme)
+        self.assertIn("manage_trakt_custom_lists", plugin_readme)
 
 
 if __name__ == "__main__":

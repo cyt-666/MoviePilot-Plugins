@@ -15,14 +15,15 @@ MoviePilot插件市场：https://github.com/cyt-666/MoviePilot-Plugins
 
 ---
 
-### Trakt WatchList 同步 `v0.6.1`
+### Trakt WatchList 同步 `v0.7.0`
 
-Trakt 观看列表、自定义列表订阅同步、完整榜单和个人播出日历插件。
+Trakt 观看列表、自定义列表订阅同步、完整榜单、个人播出日历和 MCP 安全写入插件。
 
 - **增量订阅同步**：使用 Trakt `last_activities` 仅同步发生变化的 Watchlist 和已选自定义列表；移除来源条目不会删除 MoviePilot 订阅
 - **完整榜单探索**：热门、趋势、待映、观看、收藏、推荐，以及电影周末票房
 - **个人剧集日历**：详情页按天展示未来 14 天播出日程，并标记已入库、下载中、待入库、未播出、已订阅和缺失状态
 - **MCP 查询**：`get_trakt_lists`、`get_trakt_personal_data`、`get_trakt_custom_lists` 和 `get_trakt_calendar`
+- **MCP 写入**：管理员可通过 `manage_trakt_watchlist` 修改 Watchlist，通过 `manage_trakt_custom_lists` 创建个人列表或修改列表条目；关闭 MoviePilot MCP 写操作后不会暴露这两个工具
 - **账户隔离缓存**：公开榜单缓存 6 小时，推荐、个人数据、列表条目和日历缓存 15 分钟，自定义列表目录缓存 1 小时；实时失败可回退陈旧缓存
 - **详情页管理**：查看账户、同步和日历状态，立即同步、刷新日历与缓存，并管理自定义列表订阅源
 

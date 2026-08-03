@@ -6,7 +6,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from threading import Lock, Thread
-from typing import Any, Dict, List, Optional, Tuple, Type
+from typing import Any, Dict, List, Literal, Optional, Tuple, Type
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pytz
@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 
 from app import schemas
 from app.agent.tools.base import MoviePilotTool
+from app.agent.tools.tags import ToolTag
 from app.chain.download import DownloadChain
 from app.chain.media import MediaChain
 from app.chain.subscribe import SubscribeChain
@@ -34,6 +35,7 @@ from app.schemas.types import ChainEventType, MediaType
 _token_refresh_lock = Lock()
 _sync_lock = Lock()
 _calendar_refresh_lock = Lock()
+_write_lock = Lock()
 
 
 class TraktRequestError(RuntimeError):
@@ -131,6 +133,69 @@ class GetTraktCalendarInput(BaseModel):
     page: int = Field(1, ge=1, description="Local page number, starting at 1")
     limit: int = Field(20, ge=1, le=100, description="Items per page, from 1 to 100")
     force_refresh: bool = Field(False, description="Ignore fresh calendar caches and request Trakt now")
+
+
+class TraktWriteItem(BaseModel):
+    """Trakt 批量写入条目。"""
+
+    media_type: Literal["movie", "show", "season", "episode"] = Field(
+        ...,
+        description="Media type: movie, show, season, or episode",
+    )
+    trakt_id: Optional[int] = Field(None, ge=1, description="Positive Trakt media ID")
+    tmdb_id: Optional[int] = Field(None, ge=1, description="Positive TMDB media ID")
+    imdb_id: Optional[str] = Field(None, description="Non-empty IMDb media ID")
+    tvdb_id: Optional[int] = Field(None, ge=1, description="Positive TVDB media ID")
+
+
+class ManageTraktWatchlistInput(BaseModel):
+    """Trakt Watchlist 写入参数。"""
+
+    explanation: Optional[str] = Field(
+        None,
+        description="Clear explanation of why this write operation is needed",
+    )
+    action: Literal["add", "remove"] = Field(
+        ...,
+        description="Watchlist operation: add or remove",
+    )
+    items: List[TraktWriteItem] = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="One to 100 movie, show, season, or episode items",
+    )
+
+
+class ManageTraktCustomListsInput(BaseModel):
+    """Trakt 自定义列表写入参数。"""
+
+    explanation: Optional[str] = Field(
+        None,
+        description="Clear explanation of why this write operation is needed",
+    )
+    action: Literal["create", "add_items", "remove_items"] = Field(
+        ...,
+        description="Operation: create, add_items, or remove_items",
+    )
+    list_id: Optional[int] = Field(
+        None,
+        ge=1,
+        description="Positive Trakt list ID; required for item operations",
+    )
+    name: Optional[str] = Field(None, description="List name; required for create")
+    description: Optional[str] = Field(None, description="Optional list description")
+    privacy: Literal["private", "link", "friends", "public"] = Field(
+        "private",
+        description="List privacy",
+    )
+    display_numbers: bool = Field(False, description="Number list items")
+    allow_comments: bool = Field(True, description="Allow comments on the list")
+    items: Optional[List[TraktWriteItem]] = Field(
+        None,
+        max_length=100,
+        description="Optional for create; one to 100 items for add_items or remove_items",
+    )
 
 
 class CacheRefreshRequest(BaseModel):
@@ -366,12 +431,122 @@ class GetTraktCalendarTool(MoviePilotTool):
         return _json_output(payload)
 
 
+class ManageTraktWatchlistTool(MoviePilotTool):
+    """修改管理员 Trakt 账户的 Watchlist。"""
+
+    name: str = "manage_trakt_watchlist"
+    tags: list[str] = [
+        ToolTag.Write,
+        ToolTag.Admin,
+        ToolTag.Media,
+    ]
+    description: str = (
+        "Add or remove up to 100 mixed movie, show, season, and episode items "
+        "from the configured administrator Trakt account Watchlist. This writes "
+        "to Trakt but does not immediately create MoviePilot subscriptions."
+    )
+    args_schema: Type[BaseModel] = ManageTraktWatchlistInput
+    require_admin: bool = True
+    _plugin: Any = None
+
+    def __init__(self, session_id: str, user_id: str, plugin_instance=None):
+        super().__init__(session_id=session_id, user_id=user_id)
+        self._plugin = plugin_instance
+
+    def get_tool_message(self, **kwargs) -> Optional[str]:
+        action = "添加" if kwargs.get("action") == "add" else "移除"
+        return f"Trakt Watchlist {action} {len(kwargs.get('items') or [])} 个条目"
+
+    async def run(
+        self,
+        action: str,
+        items: List[TraktWriteItem],
+        **kwargs,
+    ) -> str:
+        if not self._plugin:
+            return _tool_failure("plugin_unavailable", "TraktSync 插件实例未初始化")
+        try:
+            payload = await self.run_blocking(
+                "plugin",
+                self._plugin.manage_trakt_watchlist,
+                action,
+                items,
+            )
+        except Exception:
+            return _tool_failure("write_failed", "Trakt Watchlist 写入失败")
+        return _json_output(payload)
+
+
+class ManageTraktCustomListsTool(MoviePilotTool):
+    """创建管理员 Trakt 自定义列表或修改其条目。"""
+
+    name: str = "manage_trakt_custom_lists"
+    tags: list[str] = [
+        ToolTag.Write,
+        ToolTag.Admin,
+        ToolTag.Media,
+    ]
+    description: str = (
+        "Create a personal list for the configured administrator Trakt account, "
+        "or add and remove up to 100 mixed movie, show, season, and episode items. "
+        "Creating a list can optionally add items in the same operation."
+    )
+    args_schema: Type[BaseModel] = ManageTraktCustomListsInput
+    require_admin: bool = True
+    _plugin: Any = None
+
+    def __init__(self, session_id: str, user_id: str, plugin_instance=None):
+        super().__init__(session_id=session_id, user_id=user_id)
+        self._plugin = plugin_instance
+
+    def get_tool_message(self, **kwargs) -> Optional[str]:
+        action = kwargs.get("action") or "create"
+        if action == "create":
+            return "创建 Trakt 自定义列表"
+        action_label = "添加" if action == "add_items" else "移除"
+        return (
+            f"Trakt 列表 {kwargs.get('list_id')} {action_label} "
+            f"{len(kwargs.get('items') or [])} 个条目"
+        )
+
+    async def run(
+        self,
+        action: str,
+        list_id: Optional[int] = None,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        privacy: str = "private",
+        display_numbers: bool = False,
+        allow_comments: bool = True,
+        items: Optional[List[TraktWriteItem]] = None,
+        **kwargs,
+    ) -> str:
+        if not self._plugin:
+            return _tool_failure("plugin_unavailable", "TraktSync 插件实例未初始化")
+        try:
+            payload = await self.run_blocking(
+                "plugin",
+                self._plugin.manage_trakt_custom_lists,
+                action,
+                list_id,
+                name,
+                description,
+                privacy,
+                display_numbers,
+                allow_comments,
+                items,
+            )
+        except Exception:
+            return _tool_failure("write_failed", "Trakt 自定义列表写入失败")
+        return _json_output(payload)
+
+
 class TraktSync(_PluginBase):
     plugin_name = "Trakt Watchlist Sync"
-    plugin_desc = "同步 Trakt Watchlist 和自定义列表，并提供榜单、个人数据及日历 MCP 查询"
+    plugin_desc = "同步 Trakt Watchlist 和自定义列表，并提供 Trakt MCP 查询与安全写入"
     plugin_icon = "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/trakt.png"
     plugin_author = "cyt-666"
-    plugin_version = "0.6.1"
+    plugin_version = "0.7.0"
     author_url = "https://github.com/cyt-666/MoviePilot-Plugins"
     plugin_config_prefix = "traktsync_"
     plugin_order = 3
@@ -426,6 +601,24 @@ class TraktSync(_PluginBase):
         "subscribed": "已订阅",
         "missing": "缺失",
         "unknown": "状态未知",
+    }
+    _write_media_keys = {
+        "movie": "movies",
+        "show": "shows",
+        "season": "seasons",
+        "episode": "episodes",
+    }
+    _write_id_fields = {
+        "trakt_id": "trakt",
+        "tmdb_id": "tmdb",
+        "imdb_id": "imdb",
+        "tvdb_id": "tvdb",
+    }
+    _write_supported_ids = {
+        "movie": {"trakt", "tmdb", "imdb"},
+        "show": {"trakt", "tmdb", "imdb", "tvdb"},
+        "season": {"trakt", "tmdb", "tvdb"},
+        "episode": {"trakt", "tvdb"},
     }
 
     _scheduler: Optional[BackgroundScheduler] = None
@@ -1435,11 +1628,21 @@ class TraktSync(_PluginBase):
             def __init__(tool_self, session_id, user_id):
                 super().__init__(session_id, user_id, plugin_instance=plugin_ref)
 
+        class BoundWatchlistWriteTool(ManageTraktWatchlistTool):
+            def __init__(tool_self, session_id, user_id):
+                super().__init__(session_id, user_id, plugin_instance=plugin_ref)
+
+        class BoundCustomListsWriteTool(ManageTraktCustomListsTool):
+            def __init__(tool_self, session_id, user_id):
+                super().__init__(session_id, user_id, plugin_instance=plugin_ref)
+
         return [
             BoundListsTool,
             BoundPersonalTool,
             BoundCustomListsTool,
             BoundCalendarTool,
+            BoundWatchlistWriteTool,
+            BoundCustomListsWriteTool,
         ]
 
     def refresh_calendar_page(
@@ -1775,6 +1978,9 @@ class TraktSync(_PluginBase):
         """统一处理代理、超时、请求头、OAuth 401 刷新和分页头。"""
         if not self._client_id:
             raise TraktRequestError("Trakt Client ID 未配置")
+        request_method = str(method or "GET").upper()
+        if request_method not in ("GET", "POST"):
+            raise TraktRequestError(f"Trakt API 不支持的请求方法：{request_method}")
         if not path.startswith("/"):
             path = f"/{path}"
         url = f"{self._trakt_api_base}{path}"
@@ -1798,7 +2004,7 @@ class TraktSync(_PluginBase):
                 "proxies": settings.PROXY,
                 "timeout": self._request_timeout,
             }
-            if method.upper() == "GET":
+            if request_method == "GET":
                 return requests.get(url, **kwargs)
             kwargs["json"] = json_body
             return requests.post(url, **kwargs)
@@ -2027,6 +2233,67 @@ class TraktSync(_PluginBase):
                 removed += 1
         return removed
 
+    def _invalidate_personal_request_cache(
+        self,
+        account_uuid: str,
+        path_matcher,
+    ) -> int:
+        """只清理当前账户中与一次写操作直接相关的请求缓存。"""
+        account_uuid = str(account_uuid or "")
+        if not account_uuid:
+            return 0
+        prefix = (
+            f"{self._cache_prefix}personal_"
+            f"{self._account_cache_component(account_uuid)}_"
+        )
+        keys = []
+        for row in self._all_data_rows():
+            key = getattr(row, "key", None)
+            if not key or not key.startswith(prefix):
+                continue
+            record = self.get_data(key) or {}
+            if str(record.get("account_uuid") or "") != account_uuid:
+                continue
+            path = str(record.get("path") or "")
+            namespace = str(record.get("namespace") or "")
+            if path_matcher(path, namespace):
+                keys.append(key)
+
+        removed = 0
+        for key in set(keys):
+            if self.get_data(key) is not None:
+                self.del_data(key)
+                removed += 1
+        return removed
+
+    def _invalidate_watchlist_write_caches(self, account_uuid: str) -> int:
+        return self._invalidate_personal_request_cache(
+            account_uuid,
+            lambda path, _namespace: (
+                path.startswith("/sync/watchlist")
+                or path.startswith("/sync/progress/up_next")
+            ),
+        )
+
+    def _invalidate_custom_list_write_caches(
+        self,
+        account_uuid: str,
+        slug: str,
+        list_id: Optional[int] = None,
+    ) -> int:
+        removed = 0
+        catalog_key = self._custom_list_catalog_data_key(account_uuid)
+        if self.get_data(catalog_key) is not None:
+            self.del_data(catalog_key)
+            removed += 1
+        if list_id is None:
+            return removed
+        item_prefix = f"/users/{slug}/lists/{int(list_id)}/items"
+        return removed + self._invalidate_personal_request_cache(
+            account_uuid,
+            lambda path, _namespace: path.startswith(item_prefix),
+        )
+
     @staticmethod
     def _sanitize_payload(value: Any) -> Any:
         sensitive = {
@@ -2036,6 +2303,8 @@ class TraktSync(_PluginBase):
             "authorization",
             "email",
             "email_verified",
+            "uuid",
+            "account_uuid",
         }
         if isinstance(value, dict):
             return {
@@ -3464,6 +3733,589 @@ class TraktSync(_PluginBase):
                 str(exc),
                 list_id=list_id,
                 media_type=media_type,
+            )
+
+    @staticmethod
+    def _write_item_mapping(item: Any) -> dict:
+        if isinstance(item, dict):
+            return dict(item)
+        model_dump = getattr(item, "model_dump", None)
+        if callable(model_dump):
+            return model_dump()
+        legacy_dict = getattr(item, "dict", None)
+        if callable(legacy_dict):
+            return legacy_dict()
+        values = getattr(item, "__dict__", None)
+        if isinstance(values, dict):
+            return dict(values)
+        raise ValueError("items 中存在无效条目")
+
+    @staticmethod
+    def _positive_write_id(value: Any, field_name: str) -> int:
+        if isinstance(value, bool):
+            raise ValueError(f"{field_name} 必须为正整数")
+        if isinstance(value, int):
+            parsed = value
+        elif isinstance(value, str) and re.fullmatch(r"[0-9]+", value.strip()):
+            parsed = int(value.strip())
+        else:
+            raise ValueError(f"{field_name} 必须为正整数")
+        if parsed < 1:
+            raise ValueError(f"{field_name} 必须为正整数")
+        return parsed
+
+    def _build_write_body(
+        self,
+        items: Optional[List[Any]],
+        *,
+        allow_empty: bool = False,
+    ) -> Tuple[dict, int, int]:
+        if items is None:
+            values = []
+        elif isinstance(items, (list, tuple)):
+            values = list(items)
+        else:
+            raise ValueError("items 必须是条目数组")
+        requested_count = len(values)
+        if requested_count > 100:
+            raise ValueError("items 每次最多允许 100 个条目")
+        if not values and not allow_empty:
+            raise ValueError("items 至少需要 1 个条目")
+
+        normalized_items = []
+        seen = set()
+        for index, raw_item in enumerate(values, start=1):
+            item = self._write_item_mapping(raw_item)
+            media_type = str(item.get("media_type") or "").strip().lower()
+            if media_type not in self._write_media_keys:
+                raise ValueError(f"items[{index}].media_type 参数无效")
+
+            ids = {}
+            for input_name, trakt_name in self._write_id_fields.items():
+                value = item.get(input_name)
+                if value is None:
+                    continue
+                if trakt_name not in self._write_supported_ids[media_type]:
+                    raise ValueError(
+                        f"items[{index}] 的 {media_type} 不支持 {input_name}"
+                    )
+                if input_name == "imdb_id":
+                    if not isinstance(value, str):
+                        raise ValueError(f"items[{index}].imdb_id 必须是字符串")
+                    normalized_value = value.strip()
+                    if not normalized_value:
+                        raise ValueError(f"items[{index}].imdb_id 不能为空")
+                else:
+                    normalized_value = self._positive_write_id(
+                        value,
+                        f"items[{index}].{input_name}",
+                    )
+                    if media_type == "season" and trakt_name == "tmdb":
+                        normalized_value = str(normalized_value)
+                ids[trakt_name] = normalized_value
+            if not ids:
+                raise ValueError(f"items[{index}] 至少需要提供一种媒体 ID")
+
+            dedupe_key = (media_type, tuple(ids.items()))
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            normalized_items.append({"media_type": media_type, "ids": ids})
+
+        body = {}
+        for item in normalized_items:
+            media_key = self._write_media_keys[item["media_type"]]
+            body.setdefault(media_key, []).append({"ids": item["ids"]})
+        return body, requested_count, len(normalized_items)
+
+    @classmethod
+    def _write_section_count(cls, section: Any) -> int:
+        if not isinstance(section, dict):
+            return 0
+        count = 0
+        for media_key in cls._write_media_keys.values():
+            value = section.get(media_key)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int):
+                count += max(value, 0)
+            elif isinstance(value, list):
+                count += len(value)
+        return count
+
+    @classmethod
+    def _synthetic_existing_response(cls, body: dict) -> dict:
+        existing = {
+            media_key: len(values)
+            for media_key, values in body.items()
+            if media_key in cls._write_media_keys.values() and values
+        }
+        return {
+            "added": {},
+            "existing": existing,
+            "not_found": {},
+        }
+
+    def _write_response_payload(
+        self,
+        *,
+        target: str,
+        action: str,
+        requested_count: int,
+        unique_count: int,
+        response_data: Any,
+        status_code: Optional[int],
+        cache_invalidated: int,
+        list_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        if not isinstance(response_data, dict):
+            raise TraktRequestError("Trakt 写入响应格式无效")
+        sanitized = self._sanitize_payload(response_data)
+        added_count = self._write_section_count(sanitized.get("added"))
+        existing_count = self._write_section_count(sanitized.get("existing"))
+        removed_count = self._write_section_count(sanitized.get("removed"))
+        not_found_count = self._write_section_count(sanitized.get("not_found"))
+        changed_count = added_count + removed_count
+        completed_count = changed_count + existing_count
+        payload = {
+            "success": not_found_count == 0,
+            "meta": {
+                "target": target,
+                "action": action,
+                "list_id": list_id,
+                "requested_count": requested_count,
+                "unique_count": unique_count,
+                "affected_count": changed_count,
+                "existing_count": existing_count,
+                "not_found_count": not_found_count,
+                "partial": not_found_count > 0 and completed_count > 0,
+                "status_code": status_code,
+                "cache_invalidated": cache_invalidated,
+            },
+            "data": sanitized,
+        }
+        if not_found_count:
+            payload["meta"]["error"] = {
+                "code": "items_not_found",
+                "message": "Trakt 未识别部分或全部媒体 ID",
+            }
+        return payload
+
+    @staticmethod
+    def _write_error(code: Optional[int]) -> Tuple[str, str]:
+        errors = {
+            401: ("oauth_required", "Trakt OAuth 未授权或刷新失败"),
+            403: ("forbidden", "当前 Trakt 账户无权执行该操作"),
+            404: ("not_found", "Trakt 目标列表或资源不存在"),
+            409: ("conflict", "Trakt 写入发生冲突"),
+            420: ("limit_exceeded", "Trakt 账户列表或条目数量已达到上限"),
+            422: ("invalid_request", "Trakt 拒绝了写入参数"),
+            429: ("rate_limited", "Trakt 请求过于频繁，请稍后再试"),
+        }
+        if code in errors:
+            return errors[code]
+        if code is not None and code >= 500:
+            return "trakt_server_error", "Trakt 服务暂时不可用"
+        return "trakt_request_failed", "Trakt 写入请求失败"
+
+    def _write_failure_payload(
+        self,
+        exc: TraktRequestError,
+        *,
+        target: str,
+        action: str,
+        requested_count: int,
+        unique_count: int,
+        list_id: Optional[int] = None,
+        partial: bool = False,
+        data: Any = None,
+        cache_invalidated: int = 0,
+    ) -> Dict[str, Any]:
+        error_code, message = self._write_error(exc.status_code)
+        payload = self._failure_payload(
+            error_code,
+            message,
+            target=target,
+            action=action,
+            list_id=list_id,
+            requested_count=requested_count,
+            unique_count=unique_count,
+            partial=partial,
+            status_code=exc.status_code,
+            cache_invalidated=cache_invalidated,
+        )
+        if data is not None:
+            payload["data"] = self._sanitize_payload(data)
+        return payload
+
+    def _confirmed_write_account(self) -> dict:
+        account, account_meta = self._get_account(force_refresh=True)
+        if account_meta.get("stale"):
+            raise TraktRequestError("无法确认当前 Trakt OAuth 账户，已取消写入")
+        if not account.get("uuid"):
+            raise TraktRequestError("Trakt 账户缺少 UUID")
+        return account
+
+    def manage_trakt_watchlist(
+        self,
+        action: str,
+        items: List[Any],
+    ) -> Dict[str, Any]:
+        action = str(action or "").strip().lower()
+        raw_requested_count = len(items) if isinstance(items, (list, tuple)) else 0
+        try:
+            if action not in ("add", "remove"):
+                raise ValueError("action 参数必须是 add 或 remove")
+            body, requested_count, unique_count = self._build_write_body(items)
+        except ValueError as exc:
+            return self._failure_payload(
+                "invalid_parameters",
+                str(exc),
+                target="watchlist",
+                action=action,
+                requested_count=raw_requested_count,
+                unique_count=0,
+                affected_count=0,
+                existing_count=0,
+                not_found_count=0,
+                partial=False,
+                cache_invalidated=0,
+            )
+
+        started_at = time.monotonic()
+        account = None
+        logger.info(
+            f"Trakt 写入开始：target=watchlist action={action} "
+            f"items={unique_count}"
+        )
+        try:
+            with _write_lock:
+                account = self._confirmed_write_account()
+                endpoint = (
+                    "/sync/watchlist"
+                    if action == "add"
+                    else "/sync/watchlist/remove"
+                )
+                try:
+                    response = self._trakt_request(
+                        endpoint,
+                        method="POST",
+                        json_body=body,
+                        requires_auth=True,
+                    )
+                    cache_invalidated = self._invalidate_watchlist_write_caches(
+                        account["uuid"]
+                    )
+                    payload = self._write_response_payload(
+                        target="watchlist",
+                        action=action,
+                        requested_count=requested_count,
+                        unique_count=unique_count,
+                        response_data=response.get("data"),
+                        status_code=response.get("status_code"),
+                        cache_invalidated=cache_invalidated,
+                    )
+                except TraktRequestError as exc:
+                    if action == "add" and exc.status_code == 409:
+                        cache_invalidated = self._invalidate_watchlist_write_caches(
+                            account["uuid"]
+                        )
+                        payload = self._write_response_payload(
+                            target="watchlist",
+                            action=action,
+                            requested_count=requested_count,
+                            unique_count=unique_count,
+                            response_data=self._synthetic_existing_response(body),
+                            status_code=409,
+                            cache_invalidated=cache_invalidated,
+                        )
+                        payload["meta"]["idempotent"] = True
+                    else:
+                        raise
+            duration = round(time.monotonic() - started_at, 3)
+            logger.info(
+                f"Trakt 写入完成：target=watchlist action={action} "
+                f"success={payload.get('success')} items={unique_count} "
+                f"duration={duration}秒"
+            )
+            return payload
+        except TraktRequestError as exc:
+            duration = round(time.monotonic() - started_at, 3)
+            logger.warning(
+                f"Trakt 写入失败：target=watchlist action={action} "
+                f"status={exc.status_code or 'request_error'} duration={duration}秒"
+            )
+            return self._write_failure_payload(
+                exc,
+                target="watchlist",
+                action=action,
+                requested_count=requested_count,
+                unique_count=unique_count,
+            )
+
+    def manage_trakt_custom_lists(
+        self,
+        action: str,
+        list_id: Optional[int] = None,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        privacy: str = "private",
+        display_numbers: bool = False,
+        allow_comments: bool = True,
+        items: Optional[List[Any]] = None,
+    ) -> Dict[str, Any]:
+        action = str(action or "").strip().lower()
+        raw_requested_count = len(items) if isinstance(items, (list, tuple)) else 0
+        try:
+            if action not in ("create", "add_items", "remove_items"):
+                raise ValueError(
+                    "action 参数必须是 create、add_items 或 remove_items"
+                )
+            if action == "create":
+                if list_id is not None:
+                    raise ValueError("create 操作不能传入 list_id")
+                normalized_name = str(name or "").strip()
+                if not normalized_name:
+                    raise ValueError("create 操作必须提供非空 name")
+                normalized_privacy = str(privacy or "private").strip().lower()
+                if normalized_privacy not in ("private", "link", "friends", "public"):
+                    raise ValueError("privacy 参数无效")
+                body, requested_count, unique_count = self._build_write_body(
+                    items,
+                    allow_empty=True,
+                )
+                create_body = {
+                    "name": normalized_name,
+                    "privacy": normalized_privacy,
+                    "display_numbers": bool(display_numbers),
+                    "allow_comments": bool(allow_comments),
+                }
+                normalized_description = str(description or "").strip()
+                if normalized_description:
+                    create_body["description"] = normalized_description
+            else:
+                parsed_list_id = self._positive_write_id(list_id, "list_id")
+                list_id = parsed_list_id
+                body, requested_count, unique_count = self._build_write_body(items)
+                create_body = None
+        except ValueError as exc:
+            return self._failure_payload(
+                "invalid_parameters",
+                str(exc),
+                target="custom_list",
+                action=action,
+                list_id=list_id,
+                requested_count=raw_requested_count,
+                unique_count=0,
+                affected_count=0,
+                existing_count=0,
+                not_found_count=0,
+                partial=False,
+                cache_invalidated=0,
+            )
+
+        started_at = time.monotonic()
+        created_list = None
+        created_list_id = None
+        list_created = False
+        cache_invalidated = 0
+        logger.info(
+            f"Trakt 写入开始：target=custom_list action={action} "
+            f"list_id={list_id or '-'} items={unique_count}"
+        )
+        try:
+            with _write_lock:
+                account = self._confirmed_write_account()
+                slug = account.get("slug") or account.get("username")
+                if not slug:
+                    raise TraktRequestError("Trakt 账户缺少 slug")
+
+                if action == "create":
+                    create_response = self._trakt_request(
+                        f"/users/{slug}/lists",
+                        method="POST",
+                        json_body=create_body,
+                        requires_auth=True,
+                    )
+                    list_created = True
+                    cache_invalidated += self._invalidate_custom_list_write_caches(
+                        account["uuid"],
+                        slug,
+                    )
+                    raw_created_list = create_response.get("data")
+                    if not isinstance(raw_created_list, dict):
+                        raise TraktRequestError("Trakt 创建列表响应格式无效")
+                    try:
+                        created_list = self._normalize_custom_list(
+                            raw_created_list,
+                            set(),
+                        )
+                    except (TypeError, ValueError) as exc:
+                        raise TraktRequestError(
+                            "Trakt 创建列表响应格式无效"
+                        ) from exc
+                    created_list_id = created_list.get("list_id")
+                    if not created_list_id:
+                        raise TraktRequestError("Trakt 创建列表响应缺少列表 ID")
+
+                    if unique_count == 0:
+                        payload = {
+                            "success": True,
+                            "meta": {
+                                "target": "custom_list",
+                                "action": "create",
+                                "list_id": created_list_id,
+                                "requested_count": 0,
+                                "unique_count": 0,
+                                "affected_count": 1,
+                                "existing_count": 0,
+                                "not_found_count": 0,
+                                "partial": False,
+                                "status_code": create_response.get("status_code"),
+                                "cache_invalidated": cache_invalidated,
+                            },
+                            "data": {"created_list": created_list},
+                        }
+                    else:
+                        try:
+                            items_response = self._trakt_request(
+                                f"/users/{slug}/lists/{created_list_id}/items",
+                                method="POST",
+                                json_body=body,
+                                requires_auth=True,
+                            )
+                            cache_invalidated += (
+                                self._invalidate_custom_list_write_caches(
+                                    account["uuid"],
+                                    slug,
+                                    created_list_id,
+                                )
+                            )
+                            item_payload = self._write_response_payload(
+                                target="custom_list",
+                                action="add_items",
+                                list_id=created_list_id,
+                                requested_count=requested_count,
+                                unique_count=unique_count,
+                                response_data=items_response.get("data"),
+                                status_code=items_response.get("status_code"),
+                                cache_invalidated=cache_invalidated,
+                            )
+                        except TraktRequestError as exc:
+                            if exc.status_code != 409:
+                                raise
+                            cache_invalidated += (
+                                self._invalidate_custom_list_write_caches(
+                                    account["uuid"],
+                                    slug,
+                                    created_list_id,
+                                )
+                            )
+                            item_payload = self._write_response_payload(
+                                target="custom_list",
+                                action="add_items",
+                                list_id=created_list_id,
+                                requested_count=requested_count,
+                                unique_count=unique_count,
+                                response_data=self._synthetic_existing_response(body),
+                                status_code=409,
+                                cache_invalidated=cache_invalidated,
+                            )
+                            item_payload["meta"]["idempotent"] = True
+                        payload = {
+                            "success": item_payload["success"],
+                            "meta": {
+                                **item_payload["meta"],
+                                "action": "create",
+                                "affected_count": (
+                                    1
+                                    + int(
+                                        item_payload["meta"].get("affected_count")
+                                        or 0
+                                    )
+                                ),
+                                "partial": not item_payload["success"],
+                            },
+                            "data": {
+                                "created_list": created_list,
+                                "items": item_payload["data"],
+                            },
+                        }
+                else:
+                    endpoint_suffix = (
+                        "items" if action == "add_items" else "items/remove"
+                    )
+                    endpoint = f"/users/{slug}/lists/{list_id}/{endpoint_suffix}"
+                    try:
+                        response = self._trakt_request(
+                            endpoint,
+                            method="POST",
+                            json_body=body,
+                            requires_auth=True,
+                        )
+                        cache_invalidated = self._invalidate_custom_list_write_caches(
+                            account["uuid"],
+                            slug,
+                            list_id,
+                        )
+                        payload = self._write_response_payload(
+                            target="custom_list",
+                            action=action,
+                            list_id=list_id,
+                            requested_count=requested_count,
+                            unique_count=unique_count,
+                            response_data=response.get("data"),
+                            status_code=response.get("status_code"),
+                            cache_invalidated=cache_invalidated,
+                        )
+                    except TraktRequestError as exc:
+                        if action != "add_items" or exc.status_code != 409:
+                            raise
+                        cache_invalidated = self._invalidate_custom_list_write_caches(
+                            account["uuid"],
+                            slug,
+                            list_id,
+                        )
+                        payload = self._write_response_payload(
+                            target="custom_list",
+                            action=action,
+                            list_id=list_id,
+                            requested_count=requested_count,
+                            unique_count=unique_count,
+                            response_data=self._synthetic_existing_response(body),
+                            status_code=409,
+                            cache_invalidated=cache_invalidated,
+                        )
+                        payload["meta"]["idempotent"] = True
+
+            duration = round(time.monotonic() - started_at, 3)
+            logger.info(
+                f"Trakt 写入完成：target=custom_list action={action} "
+                f"list_id={created_list_id or list_id or '-'} "
+                f"success={payload.get('success')} items={unique_count} "
+                f"duration={duration}秒"
+            )
+            return payload
+        except TraktRequestError as exc:
+            duration = round(time.monotonic() - started_at, 3)
+            logger.warning(
+                f"Trakt 写入失败：target=custom_list action={action} "
+                f"list_id={created_list_id or list_id or '-'} "
+                f"status={exc.status_code or 'request_error'} duration={duration}秒"
+            )
+            partial_data = None
+            if list_created:
+                partial_data = {"created_list": created_list}
+            return self._write_failure_payload(
+                exc,
+                target="custom_list",
+                action=action,
+                list_id=created_list_id or list_id,
+                requested_count=requested_count,
+                unique_count=unique_count,
+                partial=list_created,
+                data=partial_data,
+                cache_invalidated=cache_invalidated,
             )
 
     def _trakt_item_to_mediainfo(self, item: dict, media_type: str):
