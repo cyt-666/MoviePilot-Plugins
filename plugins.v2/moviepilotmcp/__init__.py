@@ -3,6 +3,7 @@ import base64
 import hashlib
 import html
 import secrets
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -31,6 +32,7 @@ class OAuthAuthorizeRequest:
     code_challenge: str
     code_challenge_method: str
     raw_scope: Optional[str] = None
+    resource: Optional[str] = None
 
 
 class MoviePilotMCP(_PluginBase):
@@ -39,9 +41,9 @@ class MoviePilotMCP(_PluginBase):
     """
 
     plugin_name = "MoviePilot MCP Server"
-    plugin_desc = "MoviePilot 内置 Agent 工具的 MCP 对外暴露层，支持 OAuth 2.0 + PKCE 鉴权；OpenAPI 代码保留但当前未注册路由"
+    plugin_desc = "MoviePilot 内置 Agent 工具的 MCP 对外暴露层，支持 OAuth 2.0 + PKCE 与资源绑定鉴权；OpenAPI 代码保留但当前未注册路由"
     plugin_icon = "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/moviepilotmcp.svg"
-    plugin_version = "0.7.3"
+    plugin_version = "0.7.4"
     plugin_author = "cyt-666"
     author_url = "https://github.com/cyt-666/MoviePilot-Plugins"
     plugin_config_prefix = "moviepilotmcp_"
@@ -53,7 +55,9 @@ class MoviePilotMCP(_PluginBase):
     _oauth_scopes = ("moviepilot.mcp.read", "moviepilot.mcp.write")
     _oauth_code_ttl = 600
     _oauth_access_token_ttl = 3600
-    _oauth_refresh_token_ttl = 30 * 24 * 3600
+    # ChatGPT 插件连接是长期连接。refresh token 每次成功轮换后重新获得 180 天
+    # 空闲有效期，避免连接闲置一个月后只能显示笼统的 OAuth token 503。
+    _oauth_refresh_token_ttl = 180 * 24 * 3600
     # 插件独立管理员会话（仅服务于授权页），避免误用 MoviePilot 的 resource cookie
     # 作为登录态导致退出登录后依然能批准授权。
     _admin_session_cookie_name = "mp_mcp_admin_session"
@@ -89,6 +93,9 @@ class MoviePilotMCP(_PluginBase):
 
     def __init__(self):
         super().__init__()
+        # OAuth 状态保存在同一个 PluginData JSON 对象中，所有读改写事务必须串行，
+        # 否则并发 refresh/MCP 请求可能用旧快照覆盖刚签发的新 token。
+        self._oauth_store_lock = threading.RLock()
         self._enabled = False
         self._allow_legacy_token = False
         self._mcp_token = ""
@@ -313,7 +320,7 @@ class MoviePilotMCP(_PluginBase):
                                         "props": {
                                             "type": "info",
                                             "variant": "tonal",
-                                            "text": "该插件将 MoviePilot 内置 Agent 工具通过 MCP 和 OpenAPI 双协议对外暴露：对内复用内置 Agent tools，对外提供 MCP JSON-RPC 和 REST/OpenAPI 两种接入方式，并通过 OAuth 2.0 Authorization Code + PKCE 完成授权。",
+                                            "text": "该插件复用 MoviePilot 内置 Agent tools，通过 MCP JSON-RPC 对外提供能力，并使用 OAuth 2.0 Authorization Code + PKCE 与 MCP resource 绑定完成授权；OpenAPI 代码保留但当前未注册路由。",
                                         },
                                     }
                                 ],
@@ -492,7 +499,7 @@ class MoviePilotMCP(_PluginBase):
                                         "props": {
                                             "type": "warning",
                                             "variant": "tonal",
-                                            "text": "推荐使用 OAuth 2.0 Authorization Code + PKCE；仅支持 tools，不开放 resources/prompts；不复用 MoviePilot 全局 API Key；已移除 URL query token 作为推荐接入方式。",
+                                            "text": "推荐使用 OAuth 2.0 Authorization Code + PKCE 与 MCP resource 绑定；仅支持 tools，不开放 resources/prompts；不复用 MoviePilot 全局 API Key；已移除 URL query token 作为推荐接入方式。",
                                         },
                                     }
                                 ],
@@ -1066,7 +1073,7 @@ class MoviePilotMCP(_PluginBase):
             client_id=client_id,
             auth_method=auth_method,
             action="token",
-            result="success" if response.status_code < 400 else "rejected",
+            result=self._oauth_response_result(response),
         )
         return response
 
@@ -1210,6 +1217,7 @@ class MoviePilotMCP(_PluginBase):
                 "scope": auth_request.raw_scope or self._format_scope(auth_request.scopes),
                 "code_challenge": auth_request.code_challenge,
                 "code_challenge_method": auth_request.code_challenge_method,
+                "resource": auth_request.resource or "",
             },
         )
         response = RedirectResponse(redirect_target, status_code=302)
@@ -1283,6 +1291,7 @@ class MoviePilotMCP(_PluginBase):
         redirect_uri = (params.get("redirect_uri") or "").strip()
         client_id = (params.get("client_id") or "").strip()
         code_verifier = (params.get("code_verifier") or "").strip()
+        requested_resource = (params.get("resource") or "").strip() or None
         if not code or not redirect_uri or not client_id or not code_verifier:
             return self._oauth_error_response(
                 "invalid_request",
@@ -1290,36 +1299,62 @@ class MoviePilotMCP(_PluginBase):
                 status_code=400,
             )
 
-        store = self._load_oauth_store()
-        self._prune_oauth_store(store)
-        code_info = (store.get("codes") or {}).pop(code, None)
-        self._save_oauth_store(store)
-        if not code_info:
-            return self._oauth_error_response("invalid_grant", "授权码不存在或已失效", status_code=400)
-        if code_info.get("expires_at", 0) < self._now():
-            return self._oauth_error_response("invalid_grant", "授权码已过期", status_code=400)
-        if redirect_uri != code_info.get("redirect_uri") or client_id != code_info.get("client_id"):
-            return self._oauth_error_response("invalid_grant", "客户端信息不匹配", status_code=400)
-        if not self._verify_pkce(
-            code_verifier=code_verifier,
-            code_challenge=code_info.get("code_challenge", ""),
-            method=code_info.get("code_challenge_method", "S256"),
-        ):
-            return self._oauth_error_response("invalid_grant", "PKCE 校验失败", status_code=400)
+        with self._oauth_store_lock:
+            store = self._load_oauth_store()
+            self._prune_oauth_store(store)
+            code_info = (store.get("codes") or {}).pop(code, None)
+            if not code_info:
+                self._save_oauth_store(store)
+                return self._oauth_error_response(
+                    "invalid_grant", "授权码不存在或已失效", status_code=400
+                )
+            if code_info.get("expires_at", 0) < self._now():
+                self._save_oauth_store(store)
+                return self._oauth_error_response(
+                    "invalid_grant", "授权码已过期", status_code=400
+                )
+            if (
+                redirect_uri != code_info.get("redirect_uri")
+                or client_id != code_info.get("client_id")
+            ):
+                self._save_oauth_store(store)
+                return self._oauth_error_response(
+                    "invalid_grant", "客户端信息不匹配", status_code=400
+                )
+            if not self._verify_pkce(
+                code_verifier=code_verifier,
+                code_challenge=code_info.get("code_challenge", ""),
+                method=code_info.get("code_challenge_method", "S256"),
+            ):
+                self._save_oauth_store(store)
+                return self._oauth_error_response(
+                    "invalid_grant", "PKCE 校验失败", status_code=400
+                )
 
-        token_payload = self._issue_token_pair(
-            client_id=client_id,
-            redirect_uri=redirect_uri,
-            scopes=code_info.get("scopes") or self._default_scopes(),
-            subject=code_info.get("subject") or "admin",
-            username=code_info.get("username") or "admin",
-            requested_scope=code_info.get("requested_scope"),
-        )
-        return JSONResponse(token_payload)
+            resource = code_info.get("resource") or self._build_endpoint_url()
+            if requested_resource and requested_resource != resource:
+                self._save_oauth_store(store)
+                return self._oauth_error_response(
+                    "invalid_target", "resource 与授权码不匹配", status_code=400
+                )
+
+            token_payload = self._issue_token_pair_in_store(
+                store=store,
+                client_id=client_id,
+                redirect_uri=redirect_uri,
+                scopes=code_info.get("scopes") or self._default_scopes(),
+                subject=code_info.get("subject") or "admin",
+                username=code_info.get("username") or "admin",
+                requested_scope=code_info.get("requested_scope"),
+                resource=resource,
+            )
+            self._save_oauth_store(store)
+            return JSONResponse(token_payload)
 
     def _handle_refresh_token_grant(self, params: Dict[str, str]):
         refresh_token = (params.get("refresh_token") or "").strip()
         client_id = (params.get("client_id") or "").strip()
+        requested_resource = (params.get("resource") or "").strip() or None
         if not refresh_token or not client_id:
             return self._oauth_error_response(
                 "invalid_request",
@@ -1327,26 +1362,45 @@ class MoviePilotMCP(_PluginBase):
                 status_code=400,
             )
 
-        store = self._load_oauth_store()
-        self._prune_oauth_store(store)
-        refresh_info = (store.get("refresh_tokens") or {}).pop(refresh_token, None)
-        self._save_oauth_store(store)
-        if not refresh_info:
-            return self._oauth_error_response("invalid_grant", "refresh token 不存在或已失效", status_code=400)
-        if refresh_info.get("expires_at", 0) < self._now():
-            return self._oauth_error_response("invalid_grant", "refresh token 已过期", status_code=400)
-        if client_id != refresh_info.get("client_id"):
-            return self._oauth_error_response("invalid_grant", "client_id 不匹配", status_code=400)
+        with self._oauth_store_lock:
+            store = self._load_oauth_store()
+            self._prune_oauth_store(store)
+            refresh_info = (store.get("refresh_tokens") or {}).pop(refresh_token, None)
+            if not refresh_info:
+                self._save_oauth_store(store)
+                return self._oauth_error_response(
+                    "invalid_grant", "refresh token 不存在或已失效", status_code=400
+                )
+            if refresh_info.get("expires_at", 0) < self._now():
+                self._save_oauth_store(store)
+                return self._oauth_error_response(
+                    "invalid_grant", "refresh token 已过期", status_code=400
+                )
+            if client_id != refresh_info.get("client_id"):
+                self._save_oauth_store(store)
+                return self._oauth_error_response(
+                    "invalid_grant", "client_id 不匹配", status_code=400
+                )
 
-        token_payload = self._issue_token_pair(
-            client_id=client_id,
-            redirect_uri=refresh_info.get("redirect_uri") or "",
-            scopes=refresh_info.get("scopes") or self._default_scopes(),
-            subject=refresh_info.get("subject") or "admin",
-            username=refresh_info.get("username") or "admin",
-            requested_scope=refresh_info.get("requested_scope"),
-        )
-        return JSONResponse(token_payload)
+            resource = refresh_info.get("resource") or self._build_endpoint_url()
+            if requested_resource and requested_resource != resource:
+                self._save_oauth_store(store)
+                return self._oauth_error_response(
+                    "invalid_target", "resource 与 refresh token 不匹配", status_code=400
+                )
+
+            token_payload = self._issue_token_pair_in_store(
+                store=store,
+                client_id=client_id,
+                redirect_uri=refresh_info.get("redirect_uri") or "",
+                scopes=refresh_info.get("scopes") or self._default_scopes(),
+                subject=refresh_info.get("subject") or "admin",
+                username=refresh_info.get("username") or "admin",
+                requested_scope=refresh_info.get("requested_scope"),
+                resource=resource,
+            )
+            self._save_oauth_store(store)
+            return JSONResponse(token_payload)
 
     def _authorize_mcp_request(self, request: Request) -> Dict[str, Any]:
         authorization = request.headers.get("authorization") or ""
@@ -1373,27 +1427,46 @@ class MoviePilotMCP(_PluginBase):
                 "legacy": True,
             }
 
-        store = self._load_oauth_store()
-        self._prune_oauth_store(store)
-        access_info = (store.get("access_tokens") or {}).get(token)
-        if not access_info:
-            self._save_oauth_store(store)
-            raise HTTPException(
-                status_code=401,
-                detail="访问令牌无效",
-                headers=self._challenge_headers(error="invalid_token", description="access token 无效"),
-            )
-        if access_info.get("expires_at", 0) < self._now():
-            (store.get("access_tokens") or {}).pop(token, None)
-            self._save_oauth_store(store)
-            raise HTTPException(
-                status_code=401,
-                detail="访问令牌已过期",
-                headers=self._challenge_headers(error="invalid_token", description="access token 已过期"),
-            )
+        with self._oauth_store_lock:
+            store = self._load_oauth_store()
+            store_changed = self._prune_oauth_store(store)
+            access_info = (store.get("access_tokens") or {}).get(token)
+            if not access_info:
+                if store_changed:
+                    self._save_oauth_store(store)
+                raise HTTPException(
+                    status_code=401,
+                    detail="访问令牌无效",
+                    headers=self._challenge_headers(
+                        error="invalid_token", description="access token 无效"
+                    ),
+                )
+            if access_info.get("expires_at", 0) < self._now():
+                (store.get("access_tokens") or {}).pop(token, None)
+                self._save_oauth_store(store)
+                raise HTTPException(
+                    status_code=401,
+                    detail="访问令牌已过期",
+                    headers=self._challenge_headers(
+                        error="invalid_token", description="access token 已过期"
+                    ),
+                )
 
-        self._save_oauth_store(store)
-        return access_info
+            token_resource = access_info.get("resource")
+            if token_resource and token_resource != self._build_endpoint_url():
+                (store.get("access_tokens") or {}).pop(token, None)
+                self._save_oauth_store(store)
+                raise HTTPException(
+                    status_code=401,
+                    detail="访问令牌的 resource 不匹配",
+                    headers=self._challenge_headers(
+                        error="invalid_token", description="access token resource 不匹配"
+                    ),
+                )
+
+            if store_changed:
+                self._save_oauth_store(store)
+            return dict(access_info)
 
     @staticmethod
     def _safe_log_value(
@@ -1543,6 +1616,9 @@ class MoviePilotMCP(_PluginBase):
 
         raw_scope = (params.get("scope") or "").strip() or None
         scopes = self._normalize_requested_scopes(raw_scope)
+        resource = (params.get("resource") or "").strip() or None
+        if resource and resource != self._build_endpoint_url():
+            raise ValueError("resource 与当前 MoviePilot MCP 端点不匹配")
         return OAuthAuthorizeRequest(
             client_id=client_id,
             redirect_uri=redirect_uri,
@@ -1551,6 +1627,8 @@ class MoviePilotMCP(_PluginBase):
             code_challenge=code_challenge,
             code_challenge_method=code_challenge_method,
             raw_scope=raw_scope,
+            # 旧客户端可能不发送 RFC 8707 resource；新签发 token 仍绑定当前端点。
+            resource=resource or self._build_endpoint_url(),
         )
 
     def _normalize_requested_scopes(self, raw_scope: Optional[str]) -> List[str]:
@@ -1582,39 +1660,43 @@ class MoviePilotMCP(_PluginBase):
     def _issue_authorization_code(
         self, auth_request: OAuthAuthorizeRequest, admin: Dict[str, Any]
     ) -> str:
-        store = self._load_oauth_store()
-        self._prune_oauth_store(store)
-        code = self._generate_token()
-        (store.setdefault("codes", {}))[code] = {
-            "client_id": auth_request.client_id,
-            "redirect_uri": auth_request.redirect_uri,
-            "subject": admin.get("subject"),
-            "username": admin.get("username"),
-            "scopes": auth_request.scopes,
-            "requested_scope": auth_request.raw_scope,
-            "code_challenge": auth_request.code_challenge,
-            "code_challenge_method": auth_request.code_challenge_method,
-            "expires_at": self._now() + self._oauth_code_ttl,
-        }
-        self._save_oauth_store(store)
-        return code
+        with self._oauth_store_lock:
+            store = self._load_oauth_store()
+            self._prune_oauth_store(store)
+            code = self._generate_token()
+            (store.setdefault("codes", {}))[code] = {
+                "client_id": auth_request.client_id,
+                "redirect_uri": auth_request.redirect_uri,
+                "subject": admin.get("subject"),
+                "username": admin.get("username"),
+                "scopes": auth_request.scopes,
+                "requested_scope": auth_request.raw_scope,
+                "code_challenge": auth_request.code_challenge,
+                "code_challenge_method": auth_request.code_challenge_method,
+                "resource": auth_request.resource or self._build_endpoint_url(),
+                "expires_at": self._now() + self._oauth_code_ttl,
+            }
+            self._save_oauth_store(store)
+            return code
 
-    def _issue_token_pair(
+    def _issue_token_pair_in_store(
         self,
+        store: Dict[str, Any],
         client_id: str,
         redirect_uri: str,
         scopes: List[str],
         subject: str,
         username: str,
         requested_scope: Optional[str] = None,
+        resource: Optional[str] = None,
     ) -> Dict[str, Any]:
-        store = self._load_oauth_store()
-        self._prune_oauth_store(store)
-
+        """在调用方持有 OAuth store 锁时签发并写入一组轮换 token。"""
+        issued_at = self._now()
         access_token = self._generate_token()
         refresh_token = self._generate_token()
-        access_expires_at = self._now() + self._oauth_access_token_ttl
-        refresh_expires_at = self._now() + self._oauth_refresh_token_ttl
+        access_expires_at = issued_at + self._oauth_access_token_ttl
+        refresh_expires_at = issued_at + self._oauth_refresh_token_ttl
+        token_resource = resource or self._build_endpoint_url()
 
         store.setdefault("access_tokens", {})[access_token] = {
             "client_id": client_id,
@@ -1623,6 +1705,8 @@ class MoviePilotMCP(_PluginBase):
             "username": username,
             "scopes": scopes,
             "requested_scope": requested_scope,
+            "resource": token_resource,
+            "issued_at": issued_at,
             "expires_at": access_expires_at,
         }
         store.setdefault("refresh_tokens", {})[refresh_token] = {
@@ -1632,9 +1716,10 @@ class MoviePilotMCP(_PluginBase):
             "username": username,
             "scopes": scopes,
             "requested_scope": requested_scope,
+            "resource": token_resource,
+            "issued_at": issued_at,
             "expires_at": refresh_expires_at,
         }
-        self._save_oauth_store(store)
         # 为了避免 ChatGPT / VS Code 等客户端因「授予的 scope 不等于请求的 scope」
         # 而弹出「并非所有请求的权限都已授予」警告，若客户端传了 scope，
         # 就原样回显请求的 scope 字符串；服务端内部权限校验仍基于过滤后的 scopes。
@@ -1660,13 +1745,17 @@ class MoviePilotMCP(_PluginBase):
     def _save_oauth_store(self, store: Dict[str, Any]) -> None:
         self.save_data("oauth_store", store)
 
-    def _prune_oauth_store(self, store: Dict[str, Any]) -> None:
+    def _prune_oauth_store(self, store: Dict[str, Any]) -> bool:
+        """删除过期 OAuth 状态，并返回存储内容是否发生变化。"""
         now = self._now()
+        changed = False
         for bucket in ("codes", "access_tokens", "refresh_tokens", "admin_sessions"):
             values = store.get(bucket) or {}
             expired = [key for key, item in values.items() if (item or {}).get("expires_at", 0) < now]
             for key in expired:
                 values.pop(key, None)
+                changed = True
+        return changed
 
     async def _parse_json_request(self, request: Request) -> Dict[str, Any]:
         try:
@@ -1684,24 +1773,27 @@ class MoviePilotMCP(_PluginBase):
         grant_types: List[str],
         response_types: List[str],
     ) -> str:
-        store = self._load_oauth_store()
-        client_id = self._generate_token()
-        store.setdefault("clients", {})[client_id] = {
-            "client_name": client_name,
-            "redirect_uris": redirect_uris,
-            "grant_types": grant_types or ["authorization_code", "refresh_token"],
-            "response_types": response_types or ["code"],
-            "token_endpoint_auth_method": "none",
-            "created_at": self._now(),
-        }
-        self._save_oauth_store(store)
-        return client_id
+        with self._oauth_store_lock:
+            store = self._load_oauth_store()
+            client_id = self._generate_token()
+            store.setdefault("clients", {})[client_id] = {
+                "client_name": client_name,
+                "redirect_uris": redirect_uris,
+                "grant_types": grant_types or ["authorization_code", "refresh_token"],
+                "response_types": response_types or ["code"],
+                "token_endpoint_auth_method": "none",
+                "created_at": self._now(),
+            }
+            self._save_oauth_store(store)
+            return client_id
 
     def _get_registered_client(self, client_id: str) -> Optional[Dict[str, Any]]:
         if not client_id:
             return None
-        store = self._load_oauth_store()
-        return (store.get("clients") or {}).get(client_id)
+        with self._oauth_store_lock:
+            store = self._load_oauth_store()
+            client = (store.get("clients") or {}).get(client_id)
+            return dict(client) if client else None
 
     def _client_allows_redirect_uri(self, client_id: str, redirect_uri: str) -> bool:
         client = self._get_registered_client(client_id)
@@ -1740,36 +1832,39 @@ class MoviePilotMCP(_PluginBase):
         session_token = request.cookies.get(self._admin_session_cookie_name)
         if not session_token:
             return None
-        store = self._load_oauth_store()
-        self._prune_oauth_store(store)
-        session = (store.get("admin_sessions") or {}).get(session_token)
-        if not session:
-            self._save_oauth_store(store)
-            return None
-        if session.get("expires_at", 0) < self._now():
-            (store.get("admin_sessions") or {}).pop(session_token, None)
-            self._save_oauth_store(store)
-            return None
-        # 命中会话，顺带做一次过期剪枝
-        self._save_oauth_store(store)
-        return {
-            "subject": session.get("subject"),
-            "username": session.get("username") or "admin",
-            "session_token": session_token,
-        }
+        with self._oauth_store_lock:
+            store = self._load_oauth_store()
+            store_changed = self._prune_oauth_store(store)
+            session = (store.get("admin_sessions") or {}).get(session_token)
+            if not session:
+                if store_changed:
+                    self._save_oauth_store(store)
+                return None
+            if session.get("expires_at", 0) < self._now():
+                (store.get("admin_sessions") or {}).pop(session_token, None)
+                self._save_oauth_store(store)
+                return None
+            if store_changed:
+                self._save_oauth_store(store)
+            return {
+                "subject": session.get("subject"),
+                "username": session.get("username") or "admin",
+                "session_token": session_token,
+            }
 
     def _issue_admin_session(self, subject: str, username: str) -> Tuple[str, int]:
-        store = self._load_oauth_store()
-        self._prune_oauth_store(store)
-        session_token = self._generate_token()
-        expires_at = self._now() + self._admin_session_ttl
-        store.setdefault("admin_sessions", {})[session_token] = {
-            "subject": str(subject),
-            "username": username,
-            "expires_at": expires_at,
-        }
-        self._save_oauth_store(store)
-        return session_token, expires_at
+        with self._oauth_store_lock:
+            store = self._load_oauth_store()
+            self._prune_oauth_store(store)
+            session_token = self._generate_token()
+            expires_at = self._now() + self._admin_session_ttl
+            store.setdefault("admin_sessions", {})[session_token] = {
+                "subject": str(subject),
+                "username": username,
+                "expires_at": expires_at,
+            }
+            self._save_oauth_store(store)
+            return session_token, expires_at
 
     def _decode_moviepilot_token(self, token: str, purpose: str) -> Optional[Dict[str, Any]]:
         if not token:
@@ -1795,6 +1890,18 @@ class MoviePilotMCP(_PluginBase):
             {"error": error, "error_description": description},
             status_code=status_code,
         )
+
+    def _oauth_response_result(self, response: Response) -> str:
+        """生成不包含凭证或错误正文的 OAuth 审计结果。"""
+        if response.status_code < 400:
+            return "success"
+        try:
+            payload = json.loads(response.body or b"{}")
+            error = payload.get("error") if isinstance(payload, dict) else None
+        except (TypeError, ValueError):
+            error = None
+        error_code = self._safe_log_value(error, default="error", max_length=64)
+        return f"rejected_{error_code}"
 
     def _oauth_redirect_error(
         self,
@@ -1825,6 +1932,7 @@ class MoviePilotMCP(_PluginBase):
                 self._hidden_field("scope", auth_request.raw_scope or self._format_scope(auth_request.scopes)),
                 self._hidden_field("code_challenge", auth_request.code_challenge),
                 self._hidden_field("code_challenge_method", auth_request.code_challenge_method),
+                self._hidden_field("resource", auth_request.resource or self._build_endpoint_url()),
             ]
         )
         return f"""<!doctype html>
@@ -1884,6 +1992,7 @@ class MoviePilotMCP(_PluginBase):
                 self._hidden_field("scope", auth_request.raw_scope or self._format_scope(auth_request.scopes)),
                 self._hidden_field("code_challenge", auth_request.code_challenge),
                 self._hidden_field("code_challenge_method", auth_request.code_challenge_method),
+                self._hidden_field("resource", auth_request.resource or self._build_endpoint_url()),
             ]
         )
         error_html = (

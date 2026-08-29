@@ -6,7 +6,7 @@
 
 ## 功能概述
 
-- **OAuth 2.0 授权服务器**：完整实现 RFC 6749 授权码流程 + PKCE（RFC 7636），支持动态客户端注册（RFC 7591）
+- **OAuth 授权服务器**：实现授权码流程 + PKCE（RFC 7636）、MCP resource 绑定（RFC 8707）和动态客户端注册（RFC 7591）
 - **MCP 代理**：完成 OAuth 鉴权后，将 MCP JSON-RPC 请求原样转发至 MoviePilot 内置的 `/api/v1/mcp`
 - **OpenAPI 代码保留**：相关实现暂未注册为对外路由，当前接入方式为 MCP
 - **动态工具集**：与 MoviePilot 内置 MCP 同步，工具数量随 MoviePilot 版本、音频配置和已安装插件变化
@@ -51,6 +51,14 @@
 3. 点击连接，ChatGPT 会自动跳转至 MoviePilot 的 OAuth 授权页
 4. 输入 MoviePilot **超级管理员**账号密码（支持 OTP），点击「授权」
 5. 授权完成后，ChatGPT 即可使用 MoviePilot 的所有工具
+
+如果 ChatGPT 显示 `503 — OAuth token request failed, try again later`，先确认普通工具和
+Trakt 工具是否都失败。若都失败，请在 ChatGPT 的「设置 → 插件 → MoviePilot Assistant
+→ 插件操作」中选择 **重新连接**，重新完成一次 MoviePilot 授权。详情页的「刷新」只会
+刷新工具定义，不会重建已过期或失效的 OAuth 凭据。
+
+从 0.7.4 起，`refresh_token` 每次成功轮换后会重新获得 180 天空闲有效期；升级插件不会
+恢复此前已经过期并被清理的 token，因此旧连接首次仍需手动重新连接一次。
 
 ---
 
@@ -158,7 +166,8 @@ JSON-RPC 端点接入 ChatGPT、Codex、VS Code Copilot 或其他 MCP 客户端�
 ## 安全说明
 
 - OAuth 授权页需输入 **超级管理员**账号密码，授权会话仅保留 **2 分钟**，过期后新授权需重新登录
-- 已发放的 `access_token` 有效期 **1 小时**，`refresh_token` 有效期 **30 天**
+- 已发放的 `access_token` 有效期 **1 小时**；`refresh_token` 空闲有效期 **180 天**，每次成功刷新都会轮换并重新计时
+- 新签发的 OAuth token 会绑定当前 MCP resource，错误 resource 无法换取或使用 token
 - 建议在不需要写操作时关闭「启用写操作工具」
 - 静态 Token 模式绕过 OAuth 流程，请妥善保管 Token，不建议在生产环境启用
 
