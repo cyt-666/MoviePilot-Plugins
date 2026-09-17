@@ -15,7 +15,7 @@ MoviePilot插件市场：https://github.com/cyt-666/MoviePilot-Plugins
 
 ---
 
-### Trakt WatchList 同步 `v0.7.0`
+### Trakt WatchList 同步 `v0.7.0`（V2）、V3 `1.0.0`
 
 Trakt 观看列表、自定义列表订阅同步、完整榜单、个人播出日历和 MCP 安全写入插件。
 
@@ -35,7 +35,7 @@ Trakt 观看列表、自定义列表订阅同步、完整榜单、个人播出�
 4. 在插件详情页查看设备授权地址和代码，完成单一管理员 Trakt 账户绑定
 5. 在插件配置中启用所需探索榜单；在详情页刷新日历，并选择需要同步的自定义列表
 
-详细能力、缓存和同步语义见 [plugins.v2/traktsync/README.md](plugins.v2/traktsync/README.md)。
+详细能力、缓存和同步语义见 [plugins.v2/traktsync/README.md](plugins.v2/traktsync/README.md)；V3 版本另见 [plugins.v3/traktsync/README.md](plugins.v3/traktsync/README.md)。
 
 ---
 
@@ -50,7 +50,7 @@ Trakt 观看列表、自定义列表订阅同步、完整榜单、个人播出�
 
 ---
 
-### 媒体库服务器通知 AI 版 `v1.8.5`
+### 媒体库服务器通知 AI 版（V2 `v1.8.5`、V3 `2.0.0`）
 
 在媒体库服务器通知的基础上增加媒体删除通知，支持 AI 智能分类。
 
@@ -58,3 +58,5 @@ Trakt 观看列表、自定义列表订阅同步、完整榜单、个人播出�
 - 媒体入库、删除、播放等消息推送
 - AI 智能分类与 TMDB 信息缓存
 - 支持微信、Telegram、Slack 等通知渠道
+
+V3 版本使用 `MediaSource.TMDB` 与 `media_id` 调用宿主媒体识别链路，V2 版本保持原有实现不变。
