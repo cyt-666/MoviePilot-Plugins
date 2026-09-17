@@ -9,7 +9,7 @@ from typing import Any, List, Dict, Tuple, Optional
 from app.sdk.cache import cached
 from app.sdk.events import eventmanager, Event
 from app.sdk.logging import logger
-from app.sdk.plugins import _PluginBase
+from app.sdk.plugin import _PluginBase
 from app.sdk.services import MediaServerHelper
 from app.sdk.network import WebUtils
 from app.modules.themoviedb import CategoryHelper

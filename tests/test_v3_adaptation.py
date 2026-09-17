@@ -63,6 +63,8 @@ def test_v3_plugins_do_not_call_legacy_generic_media_contracts():
             if isinstance(node, ast.ImportFrom)
         ]
         assert not any(module.startswith("app.db.") for module in imports)
+        assert "app.sdk.plugin" in imports
+        assert "app.sdk.plugins" not in imports
         for call in _call_names(source, "recognize_media"):
             assert not any(keyword.arg == "tmdbid" for keyword in call.keywords)
         for call in _call_names(source, "add"):

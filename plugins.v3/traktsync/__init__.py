@@ -25,7 +25,7 @@ from app.sdk.config import settings
 from app.sdk.events import Event, eventmanager
 from app.sdk.logging import logger
 from app.sdk.media import MetaInfo, resolve_media_identity
-from app.sdk.plugins import _PluginBase
+from app.sdk.plugin import _PluginBase
 from app.sdk.queries import (
     DownloadHistoryFilter,
     QueryPageRequest,
