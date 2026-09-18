@@ -33,6 +33,7 @@ def test_v3_registry_and_source_versions_are_aligned():
     package_v2 = json.loads((ROOT / "package.v2.json").read_text(encoding="utf-8"))
     package_v3 = json.loads((ROOT / "package.v3.json").read_text(encoding="utf-8"))
     expected = {
+        "MoviePilotMCP": ("1.0.0", ROOT / "plugins.v3" / "moviepilotmcp"),
         "TraktSync": ("1.0.0", ROOT / "plugins.v3" / "traktsync"),
         "mediamsgwithdeletemsg": (
             "2.0.0",
@@ -52,6 +53,7 @@ def test_v3_registry_and_source_versions_are_aligned():
 
 def test_v3_plugins_do_not_call_legacy_generic_media_contracts():
     v3_sources = [
+        ROOT / "plugins.v3" / "moviepilotmcp" / "__init__.py",
         ROOT / "plugins.v3" / "traktsync" / "__init__.py",
         ROOT / "plugins.v3" / "mediamsgwithdeletemsg" / "__init__.py",
     ]
@@ -70,3 +72,18 @@ def test_v3_plugins_do_not_call_legacy_generic_media_contracts():
         for call in _call_names(source, "add"):
             if isinstance(call.func.value, ast.Attribute) and call.func.value.attr == "subscribechain":
                 assert not any(keyword.arg == "tmdbid" for keyword in call.keywords)
+
+
+def test_v3_moviepilot_mcp_uses_v3_sdk_and_keeps_v2_source_separate():
+    """V3 MCP 包装层必须使用 V3 SDK，V2 源码目录保持独立。"""
+    v2_source = (ROOT / "plugins.v2" / "moviepilotmcp" / "__init__.py").read_text(encoding="utf-8")
+    v3_source = (ROOT / "plugins.v3" / "moviepilotmcp" / "__init__.py").read_text(encoding="utf-8")
+
+    assert "from app.sdk.config import settings" in v3_source
+    assert "from app.sdk.logging import logger" in v3_source
+    assert "from app.sdk.plugin import _PluginBase" in v3_source
+    assert "_compact_moviepilot_api_schema" in v3_source
+    assert "enable_write_tools" not in v3_source
+    assert "_enable_write_tools" not in v3_source
+    assert "from app.sdk.config import settings" not in v2_source
+    assert "_compact_moviepilot_api_schema" not in v2_source

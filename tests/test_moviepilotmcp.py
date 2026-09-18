@@ -91,7 +91,7 @@ class _Settings:
         return f"https://mp.example.com/{path.lstrip('/')}"
 
 
-def _load_plugin_module_with_stubs():
+def _load_plugin_module_with_stubs(source_dir="plugins.v2/moviepilotmcp"):
     _install_module("httpx")
     _install_module("jwt", decode=lambda *args, **kwargs: {})
     _install_module("fastapi", HTTPException=_HTTPException, Request=object)
@@ -107,11 +107,13 @@ def _load_plugin_module_with_stubs():
     _install_module("app.core.config", settings=_Settings())
     _install_module("app.log", logger=_Logger())
     _install_module("app.plugins", _PluginBase=_PluginBase)
+    _install_module("app.sdk.config", settings=_Settings())
+    _install_module("app.sdk.logging", logger=_Logger())
+    _install_module("app.sdk.plugin", _PluginBase=_PluginBase)
 
     plugin_path = (
         Path(__file__).parents[1]
-        / "plugins.v2"
-        / "moviepilotmcp"
+        / source_dir
         / "__init__.py"
     )
     module_name = "moviepilotmcp_plugin_under_test"
@@ -122,10 +124,10 @@ def _load_plugin_module_with_stubs():
     return module
 
 
-def _load_plugin_module():
+def _load_plugin_module(source_dir="plugins.v2/moviepilotmcp"):
     original_modules = sys.modules.copy()
     try:
-        return _load_plugin_module_with_stubs()
+        return _load_plugin_module_with_stubs(source_dir)
     finally:
         added_modules = set(sys.modules) - set(original_modules)
         for name in added_modules:
@@ -364,6 +366,56 @@ class MoviePilotMCPOAuthTest(unittest.TestCase):
         self.assertEqual(
             plugin._oauth_response_result(response),
             "rejected_invalid_grant",
+        )
+
+
+class MoviePilotMCPV3SchemaTest(unittest.TestCase):
+    """V3 包装层的外部 Schema 兼容投影测试。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.module = _load_plugin_module("plugins.v3/moviepilotmcp")
+
+    def test_v3_compacts_moviepilot_api_schema_without_changing_operation_ids(self):
+        plugin = self.module.MoviePilotMCP()
+        source_schema = {
+            "properties": {
+                "operation_id": {
+                    "type": "string",
+                    "enum": ["subscription.list", "media.search"],
+                }
+            },
+            "oneOf": [
+                {
+                    "properties": {
+                        "operation_id": {"const": "subscription.list"},
+                    }
+                },
+                {
+                    "properties": {
+                        "operation_id": {"const": "media.search"},
+                    }
+                },
+            ],
+            "$defs": {"LargeModel": {"type": "object"}},
+        }
+
+        compact = plugin._compact_moviepilot_api_schema(source_schema)
+
+        self.assertEqual(
+            compact["properties"]["operation_id"]["enum"],
+            ["media.search", "subscription.list"],
+        )
+        self.assertNotIn("oneOf", compact)
+        self.assertNotIn("$defs", compact)
+        self.assertEqual(compact["required"], ["operation_id"])
+
+        rewritten = plugin._rewrite_tool_list(
+            [{"name": "moviepilot_api", "description": "gateway", "inputSchema": source_schema}]
+        )
+        self.assertEqual(
+            rewritten[0]["inputSchema"]["properties"]["operation_id"]["enum"],
+            ["media.search", "subscription.list"],
         )
 
 

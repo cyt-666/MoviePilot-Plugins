@@ -7,6 +7,7 @@
         "icon": "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/moviepilotmcp.svg",
         "author": "cyt-666",
         "level": 1,
+        "v3": false,
         "history": {
             "v0.7.4": "修复 ChatGPT 长期连接出现 OAuth token request failed：refresh token 改为成功轮换后重新计算 180 天空闲有效期；OAuth store 读改写事务串行并原子提交，避免并发请求覆盖新 token；按当前 MCP 授权契约绑定并校验 resource，审计日志增加不泄露凭证的 OAuth 拒绝原因；补充 ChatGPT 重新连接说明。",
             "v0.7.3": "修复写操作开关使用过时工具名导致的漏拦截问题：优先按内置工具运行时 write 标签动态识别，并补充当前版本兼容名单；同步 README 的动态工具列表和 OpenAPI 当前未暴露状态。",
