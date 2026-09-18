@@ -33,7 +33,7 @@ def test_v3_registry_and_source_versions_are_aligned():
     package_v2 = json.loads((ROOT / "package.v2.json").read_text(encoding="utf-8"))
     package_v3 = json.loads((ROOT / "package.v3.json").read_text(encoding="utf-8"))
     expected = {
-        "MoviePilotMCP": ("1.0.0", ROOT / "plugins.v3" / "moviepilotmcp"),
+        "MoviePilotMCP": ("1.1.0", ROOT / "plugins.v3" / "moviepilotmcp"),
         "TraktSync": ("1.0.0", ROOT / "plugins.v3" / "traktsync"),
         "mediamsgwithdeletemsg": (
             "2.0.0",

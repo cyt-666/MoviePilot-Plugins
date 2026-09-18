@@ -43,7 +43,7 @@ class MoviePilotMCP(_PluginBase):
     plugin_name = "MoviePilot MCP Server"
     plugin_desc = "MoviePilot V3 内置 Agent 工具的 MCP 对外暴露层，支持 OAuth 2.0 + PKCE 与资源绑定鉴权；兼容外部客户端的大型工具 Schema"
     plugin_icon = "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/moviepilotmcp.svg"
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     plugin_author = "cyt-666"
     author_url = "https://github.com/cyt-666/MoviePilot-Plugins"
     plugin_config_prefix = "moviepilotmcp_"
@@ -55,6 +55,7 @@ class MoviePilotMCP(_PluginBase):
     _oauth_scopes = ("moviepilot.mcp.read", "moviepilot.mcp.write")
     _oauth_code_ttl = 600
     _oauth_access_token_ttl = 3600
+    _operation_contract_tool_name = "moviepilot_api_describe"
     # ChatGPT 插件连接是长期连接。refresh token 每次成功轮换后重新获得 180 天
     # 空闲有效期，避免连接闲置一个月后只能显示笼统的 OAuth token 503。
     _oauth_refresh_token_ttl = 180 * 24 * 3600
@@ -172,19 +173,259 @@ class MoviePilotMCP(_PluginBase):
             "additionalProperties": False,
         }
 
+    @classmethod
+    def _build_operation_contract_tool(cls, operation_ids: List[str]) -> Dict[str, Any]:
+        """构造按需查询单个 operation 参数合同的只读 MCP 工具。"""
+        return {
+            "name": cls._operation_contract_tool_name,
+            "description": (
+                "Read-only MoviePilot V3 operation contract lookup. Pass one operation_id to get its "
+                "allowed and required arguments before calling moviepilot_api. This tool only describes "
+                "the input contract and never executes a MoviePilot operation."
+            ),
+            "inputSchema": {
+                "title": cls._operation_contract_tool_name,
+                "type": "object",
+                "properties": {
+                    "operation_id": {
+                        "type": "string",
+                        "description": "Exact allowlisted MoviePilot V3 operation ID.",
+                        "enum": operation_ids,
+                    }
+                },
+                "required": ["operation_id"],
+                "additionalProperties": False,
+            },
+            "annotations": {
+                "readOnlyHint": True,
+                "destructiveHint": False,
+                "idempotentHint": True,
+                "openWorldHint": False,
+            },
+        }
+
+    @staticmethod
+    def _find_moviepilot_api_schema(tools: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """从内置工具列表中找到 moviepilot_api 的原始输入合同。"""
+        for tool in tools:
+            if not isinstance(tool, dict) or tool.get("name") != "moviepilot_api":
+                continue
+            schema = tool.get("inputSchema")
+            if isinstance(schema, dict):
+                return schema
+        return None
+
+    @staticmethod
+    def _fallback_operation_input_contract(schema: Any, operation_id: str) -> Dict[str, Any]:
+        """V3 合同辅助函数不可用时，退化为单分支合同，避免返回整个大型 Schema。"""
+        branches = schema.get("oneOf") if isinstance(schema, dict) else None
+        branch = next(
+            (
+                item
+                for item in branches or []
+                if isinstance(item, dict)
+                and isinstance(item.get("properties"), dict)
+                and isinstance(item["properties"].get("operation_id"), dict)
+                and item["properties"]["operation_id"].get("const") == operation_id
+            ),
+            None,
+        )
+        if not isinstance(branch, dict):
+            return {"operation_id": operation_id, "available": False}
+
+        properties = branch.get("properties") or {}
+        contract: Dict[str, Any] = {
+            "operation_id": operation_id,
+            "allowed_arguments": [
+                name for name in properties if isinstance(name, str) and name != "operation_id"
+            ],
+        }
+        required = branch.get("required")
+        if isinstance(required, list):
+            contract["required_arguments"] = [
+                name for name in required if isinstance(name, str) and name != "operation_id"
+            ]
+        for name in ("path_params", "query", "body"):
+            node = properties.get(name)
+            if isinstance(node, dict):
+                contract[name] = node
+        return contract
+
+    @classmethod
+    def _get_operation_input_contract(cls, schema: Any, operation_id: str) -> Dict[str, Any]:
+        """复用 V3 内置合同摘要；插件单独加载时保留单分支兼容退化。"""
+        try:
+            from app.agent.api.arguments import api_input_contract
+
+            return api_input_contract(operation_id, schema)
+        except (ImportError, ModuleNotFoundError):
+            return cls._fallback_operation_input_contract(schema, operation_id)
+
+    @classmethod
+    def _build_operation_contract_result(
+        cls,
+        schema: Any,
+        operation_id: Any,
+    ) -> Tuple[Dict[str, Any], bool]:
+        """生成 describe 工具结果，并标记是否应作为 MCP 工具错误返回。"""
+        if not isinstance(operation_id, str) or not operation_id.strip():
+            return (
+                {
+                    "success": False,
+                    "error": "invalid_input",
+                    "message": "operation_id 必须是 tools/list 返回的有效 operation ID。",
+                },
+                True,
+            )
+
+        operation_id = operation_id.strip()
+        contract = cls._get_operation_input_contract(schema, operation_id)
+        if not isinstance(contract, dict) or contract.get("available") is False:
+            return (
+                {
+                    "success": False,
+                    "error": "unknown_operation",
+                    "operation_id": operation_id,
+                    "message": "未找到该 operation，请从 moviepilot_api 的 operation_id 枚举中选择。",
+                },
+                True,
+            )
+        return (
+            {
+                "success": True,
+                "operation_id": operation_id,
+                "input_contract": contract,
+                "next_action": "按 input_contract 组装参数后调用 moviepilot_api。",
+            },
+            False,
+        )
+
+    @staticmethod
+    def _jsonrpc_tool_result(request_id: Any, payload: Dict[str, Any], is_error: bool = False) -> Dict[str, Any]:
+        """构造本地虚拟 MCP 工具的 JSON-RPC 响应。"""
+        result: Dict[str, Any] = {
+            "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}]
+        }
+        if is_error:
+            result["isError"] = True
+        return {"jsonrpc": "2.0", "id": request_id, "result": result}
+
+    @classmethod
+    def _describe_tool_call_response(
+        cls,
+        message: Dict[str, Any],
+        schema: Optional[Dict[str, Any]],
+        fetch_error: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """处理单个 moviepilot_api_describe 调用；通知不返回响应。"""
+        if message.get("id") is None:
+            return None
+        if fetch_error:
+            return cls._jsonrpc_tool_result(
+                message.get("id"),
+                {
+                    "success": False,
+                    "error": "contract_unavailable",
+                    "message": f"无法读取 MoviePilot operation 合同：{fetch_error}",
+                },
+                is_error=True,
+            )
+        params = message.get("params")
+        arguments = params.get("arguments") if isinstance(params, dict) else None
+        operation_id = arguments.get("operation_id") if isinstance(arguments, dict) else None
+        if schema is None:
+            payload = {
+                "success": False,
+                "error": "contract_unavailable",
+                "message": "内置 MCP 未返回 moviepilot_api 的输入合同。",
+            }
+            return cls._jsonrpc_tool_result(message.get("id"), payload, is_error=True)
+        try:
+            payload, is_error = cls._build_operation_contract_result(schema, operation_id)
+        except Exception as err:
+            logger.error(f"生成 MoviePilot operation 合同失败：{err}", exc_info=True)
+            payload = {
+                "success": False,
+                "error": "contract_unavailable",
+                "message": "生成 operation 合同失败，请稍后重试。",
+            }
+            is_error = True
+        return cls._jsonrpc_tool_result(message.get("id"), payload, is_error=is_error)
+
+    async def _handle_local_describe_calls(self, payload: Any):
+        """在插件层处理 describe 工具，普通工具消息继续转发至内置 MCP。"""
+        messages = payload if isinstance(payload, list) else [payload]
+        describe_messages: List[Dict[str, Any]] = []
+        forwarded_messages: List[Any] = []
+        for message in messages:
+            params = message.get("params") if isinstance(message, dict) else None
+            if (
+                isinstance(message, dict)
+                and message.get("method") == "tools/call"
+                and isinstance(params, dict)
+                and params.get("name") == self._operation_contract_tool_name
+            ):
+                describe_messages.append(message)
+            else:
+                forwarded_messages.append(message)
+        if not describe_messages:
+            return None
+
+        raw_tools, fetch_error = await self._fetch_raw_mcp_tools()
+        schema = self._find_moviepilot_api_schema(raw_tools)
+        responses = [
+            response
+            for message in describe_messages
+            if (response := self._describe_tool_call_response(message, schema, fetch_error)) is not None
+        ]
+
+        if forwarded_messages:
+            forwarded_payload = forwarded_messages if isinstance(payload, list) else forwarded_messages[0]
+            forwarded_data, forwarded_error = await self._forward_to_internal_mcp(
+                json.dumps(forwarded_payload, ensure_ascii=False).encode("utf-8")
+            )
+            if forwarded_error:
+                responses.extend(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": message.get("id") if isinstance(message, dict) else None,
+                        "error": {"code": -32603, "message": forwarded_error},
+                    }
+                    for message in forwarded_messages
+                    if isinstance(message, dict) and message.get("id") is not None
+                )
+            elif forwarded_data is not None:
+                if isinstance(forwarded_data, list):
+                    responses.extend(forwarded_data)
+                else:
+                    responses.append(forwarded_data)
+
+        if isinstance(payload, list):
+            return Response(status_code=202) if not responses else JSONResponse(responses)
+        return Response(status_code=202) if not responses else JSONResponse(responses[0])
+
     def _rewrite_tool_list(
         self,
         tools: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
         """压缩 V3 moviepilot_api 的工具输入合同，不裁剪工具能力。"""
         rewritten: List[Dict[str, Any]] = []
+        operation_ids: List[str] = []
         for tool in tools:
             if not isinstance(tool, dict):
                 continue
             if tool.get("name") == "moviepilot_api":
                 tool = dict(tool)
-                tool["inputSchema"] = self._compact_moviepilot_api_schema(tool.get("inputSchema") or {})
+                input_schema = tool.get("inputSchema") or {}
+                operation_ids = self._moviepilot_operation_ids(input_schema)
+                tool["inputSchema"] = self._compact_moviepilot_api_schema(input_schema)
             rewritten.append(tool)
+        if operation_ids and not any(
+            tool.get("name") == self._operation_contract_tool_name
+            for tool in rewritten
+            if isinstance(tool, dict)
+        ):
+            rewritten.append(self._build_operation_contract_tool(operation_ids))
         return rewritten
 
     def _rewrite_tools_list_response(
@@ -589,8 +830,8 @@ class MoviePilotMCP(_PluginBase):
 
     async def handle_mcp(self, request: Request):
         """
-        MCP JSON-RPC 代理端点：完成 OAuth Bearer 认证后，将请求原样转发至
-        MoviePilot 内置 /api/v1/mcp，由内置 MCP Server 统一处理完整工具调度。
+        MCP JSON-RPC 代理端点：完成 OAuth Bearer 认证后，将普通请求转发至
+        MoviePilot 内置 /api/v1/mcp；参数合同查询由包装层本地处理。
         """
         if not self._enabled:
             raise HTTPException(status_code=403, detail="MoviePilot MCP 包装层未启用")
@@ -642,6 +883,10 @@ class MoviePilotMCP(_PluginBase):
         # 全为通知（无 id）→ 直接 202，无需转发
         if all(not isinstance(m, dict) or m.get("id") is None for m in messages):
             return Response(status_code=202)
+
+        local_response = await self._handle_local_describe_calls(payload)
+        if local_response is not None:
+            return local_response
 
         # 转发至内置 MCP，附带 MoviePilot API Token
         internal_url = f"http://127.0.0.1:{settings.PORT}{settings.API_V1_STR}/mcp"
@@ -725,9 +970,9 @@ class MoviePilotMCP(_PluginBase):
         except Exception:
             return None, f"内部 MCP 响应解析失败：status={resp.status_code}"
 
-    async def _fetch_mcp_tools(self) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    async def _fetch_raw_mcp_tools(self) -> Tuple[List[Dict[str, Any]], Optional[str]]:
         """
-        通过内部 MCP tools/list 获取完整可用工具列表。
+        通过内部 MCP tools/list 获取未经过包装层改写的完整工具列表。
         返回 (工具列表, 错误信息)。
         """
         payload = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
@@ -742,6 +987,13 @@ class MoviePilotMCP(_PluginBase):
         tools = result.get("tools")
         if not isinstance(tools, list):
             return [], "内部 MCP 响应缺少 tools"
+        return tools, None
+
+    async def _fetch_mcp_tools(self) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        """获取完整工具列表并应用 V3 对外兼容投影。"""
+        tools, error = await self._fetch_raw_mcp_tools()
+        if error:
+            return [], error
         return self._rewrite_tool_list(tools), None
 
     @staticmethod

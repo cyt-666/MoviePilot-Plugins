@@ -9,6 +9,7 @@
 - **OAuth 授权服务器**：实现授权码流程 + PKCE（RFC 7636）、MCP resource 绑定（RFC 8707）和动态客户端注册（RFC 7591）
 - **MCP 代理**：完成 OAuth 鉴权后，将 MCP JSON-RPC 请求转发至 MoviePilot V3 内置的 `/api/v1/mcp`
 - **Schema 兼容**：在包装层压缩 `moviepilot_api` 的大型 V3 `oneOf` 合同，保留 operation ID 枚举和服务端精确校验，避免 ChatGPT 转换时丢失工具 Schema
+- **按需参数合同**：提供只读 `moviepilot_api_describe`，Agent 可先查询单个 operation 的允许参数和必填参数，再调用 `moviepilot_api`
 - **OpenAPI 代码保留**：相关实现暂未注册为对外路由，当前接入方式为 MCP
 - **动态工具集**：与 MoviePilot 内置 MCP 同步，工具数量随 MoviePilot 版本、音频配置和已安装插件变化
 - **完整工具能力**：V3 不提供伪只读开关，工具能力由 MoviePilot 内置 MCP 和管理员授权统一决定
@@ -159,7 +160,8 @@ JSON-RPC 端点接入 ChatGPT、Codex、VS Code Copilot 或其他 MCP 客户端�
 `write_file` 和 `read_file`。因此 81 不是最终对外工具数。
 
 V3 插件不再提供 V2 的工具级写操作开关。MoviePilot 内置 MCP 返回的完整工具目录会通过包装层
-转发；`moviepilot_api` 的实际 operation 参数和权限仍由 MoviePilot V3 服务端校验。
+转发；包装层额外提供只读 `moviepilot_api_describe`，用于查询单个 operation 的参数合同。
+`moviepilot_api` 的实际 operation 参数和权限仍由 MoviePilot V3 服务端校验。
 
 ---
 

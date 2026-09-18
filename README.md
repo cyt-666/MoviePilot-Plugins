@@ -3,7 +3,7 @@ MoviePilot插件市场：https://github.com/cyt-666/MoviePilot-Plugins
 
 ## 插件列表
 
-### MoviePilot MCP Server（V2 `v0.7.4`、V3 `1.0.0`）
+### MoviePilot MCP Server（V2 `v0.7.4`、V3 `1.1.0`）
 
 将 MoviePilot 内置 Agent 工具通过 **MCP（Model Context Protocol）** 暴露给 ChatGPT、VS Code Copilot、Claude 等 AI 客户端。
 
@@ -11,6 +11,7 @@ MoviePilot插件市场：https://github.com/cyt-666/MoviePilot-Plugins
 - 转发至 MoviePilot 内置 MCP，覆盖全部内置工具
 - V2 保留写操作开关；V3 使用完整工具能力，由 MoviePilot V3 服务端统一校验
 - V3 包装层压缩 `moviepilot_api` 的大型 Schema，避免 ChatGPT 工具转换时丢失 Schema
+- V3 提供只读 `moviepilot_api_describe`，按 operation 查询精确参数合同，帮助 Agent 纠正调用格式
 
 V2 详见 [plugins.v2/moviepilotmcp/README.md](plugins.v2/moviepilotmcp/README.md)，V3 详见 [plugins.v3/moviepilotmcp/README.md](plugins.v3/moviepilotmcp/README.md)。
 

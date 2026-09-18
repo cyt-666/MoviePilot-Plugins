@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import copy
 import hashlib
@@ -389,7 +390,13 @@ class MoviePilotMCPV3SchemaTest(unittest.TestCase):
                 {
                     "properties": {
                         "operation_id": {"const": "subscription.list"},
-                    }
+                        "body": {
+                            "type": "object",
+                            "properties": {"title": {"type": "string"}},
+                            "required": ["title"],
+                        },
+                    },
+                    "required": ["operation_id", "body"],
                 },
                 {
                     "properties": {
@@ -417,6 +424,87 @@ class MoviePilotMCPV3SchemaTest(unittest.TestCase):
             rewritten[0]["inputSchema"]["properties"]["operation_id"]["enum"],
             ["media.search", "subscription.list"],
         )
+
+        describe_tool = next(
+            tool for tool in rewritten if tool["name"] == "moviepilot_api_describe"
+        )
+        self.assertEqual(
+            describe_tool["inputSchema"]["properties"]["operation_id"]["enum"],
+            ["media.search", "subscription.list"],
+        )
+        self.assertTrue(describe_tool["annotations"]["readOnlyHint"])
+
+    def test_v3_describe_returns_operation_contract_without_forwarding_execution(self):
+        plugin = self.module.MoviePilotMCP()
+        source_schema = {
+            "oneOf": [
+                {
+                    "properties": {
+                        "operation_id": {"const": "subscription.add"},
+                        "body": {
+                            "type": "object",
+                            "properties": {"title": {"type": "string"}},
+                            "required": ["title"],
+                        },
+                    },
+                    "required": ["operation_id", "body"],
+                }
+            ]
+        }
+
+        async def fetch_tools():
+            return ([{"name": "moviepilot_api", "inputSchema": source_schema}], None)
+
+        async def unexpected_forward(_):
+            raise AssertionError("describe 工具不应转发为业务工具调用")
+
+        plugin._fetch_raw_mcp_tools = fetch_tools
+        plugin._forward_to_internal_mcp = unexpected_forward
+        response = asyncio.run(
+            plugin._handle_local_describe_calls(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 9,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "moviepilot_api_describe",
+                        "arguments": {"operation_id": "subscription.add"},
+                    },
+                }
+            )
+        )
+
+        payload = json.loads(response.body)
+        result = json.loads(payload["result"]["content"][0]["text"])
+        self.assertTrue(result["success"])
+        self.assertEqual(result["operation_id"], "subscription.add")
+        self.assertEqual(result["input_contract"]["required_arguments"], ["body"])
+        self.assertIn("body", result["input_contract"])
+
+    def test_v3_describe_unknown_operation_returns_tool_error(self):
+        plugin = self.module.MoviePilotMCP()
+        source_schema = {
+            "oneOf": [
+                {
+                    "properties": {
+                        "operation_id": {"const": "media.search"},
+                    }
+                }
+            ]
+        }
+        response = plugin._describe_tool_call_response(
+            {
+                "id": 10,
+                "params": {
+                    "arguments": {"operation_id": "not.allowed"},
+                },
+            },
+            source_schema,
+        )
+
+        payload = json.loads(response["result"]["content"][0]["text"])
+        self.assertTrue(response["result"]["isError"])
+        self.assertEqual(payload["error"], "unknown_operation")
 
 
 if __name__ == "__main__":

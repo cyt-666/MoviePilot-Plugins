@@ -3,12 +3,13 @@
         "name": "MoviePilot MCP Server",
         "description": "MoviePilot V3 内置 Agent 工具的 MCP 对外暴露层，支持 OAuth 2.0 + PKCE、MCP resource 绑定鉴权和大型工具 Schema 兼容",
         "labels": "MCP,OpenAPI,ChatGPT,Codex,自动化,MoviePilot,V3",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "icon": "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/moviepilotmcp.svg",
         "author": "cyt-666",
         "level": 1,
         "system_version": ">=3.0.0",
         "history": {
+            "v1.1.0": "新增只读 moviepilot_api_describe 工具：Agent 可按 operation_id 查询有界参数合同，再调用 moviepilot_api；普通调用和服务端精确校验保持不变。",
             "v1.0.0": "适配 MoviePilot V3：迁移至 V3 SDK，并在包装层压缩 moviepilot_api 的大型 oneOf Schema，保留 operation ID 枚举和服务端精确参数校验，避免 ChatGPT 转换时丢失工具 Schema。",
             "v0.7.4": "修复 ChatGPT 长期连接出现 OAuth token request failed：refresh token 改为成功轮换后重新计算 180 天空闲有效期；OAuth store 读改写事务串行并原子提交，避免并发请求覆盖新 token；按当前 MCP 授权契约绑定并校验 resource，审计日志增加不泄露凭证的 OAuth 拒绝原因；补充 ChatGPT 重新连接说明。"
         }
