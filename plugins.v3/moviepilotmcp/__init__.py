@@ -5,6 +5,7 @@ import html
 import secrets
 import threading
 import time
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -43,7 +44,7 @@ class MoviePilotMCP(_PluginBase):
     plugin_name = "MoviePilot MCP Server"
     plugin_desc = "MoviePilot V3 内置 Agent 工具的 MCP 对外暴露层，支持 OAuth 2.0 + PKCE 与资源绑定鉴权；兼容外部客户端的大型工具 Schema"
     plugin_icon = "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/moviepilotmcp.svg"
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     plugin_author = "cyt-666"
     author_url = "https://github.com/cyt-666/MoviePilot-Plugins"
     plugin_config_prefix = "moviepilotmcp_"
@@ -67,6 +68,73 @@ class MoviePilotMCP(_PluginBase):
     _agent_manager_candidates = [
         ("app.agent.tools.manager", "MoviePilotToolsManager"),
     ]
+    # V3 原始 OpenAPI 对少量高频 operation 的语义或离散值描述不完整。
+    # 这些仅用于对外 describe，不改变 MoviePilot 服务端实际校验和执行行为。
+    _operation_descriptor_overrides: Dict[str, Dict[str, Any]] = {
+        "media.search": {
+            "purpose": "按标题从元数据源搜索候选媒体、音乐、合集或人物，返回候选列表。",
+            "use_when": [
+                "需要按名称浏览或选择多个候选媒体。",
+                "后续需要从候选结果中取得服务端返回的媒体身份。",
+            ],
+            "do_not_use_when": [
+                "输入是种子标题、文件名或包含发布组和季集信息，需要解析为单个媒体身份；应使用 media.recognize。",
+                "需要搜索站点种子资源；应使用 search.title 等站点搜索 operation。",
+            ],
+            "field_rules": {
+                "query.type": {
+                    "allowed_values": ["media", "music", "collection", "person"],
+                    "default": "media",
+                    "description": "搜索类别。media 为影视媒体候选；music 为音乐实体；collection 为合集；person 为人物。不要传 movie、tv 或中文显示名称。",
+                },
+                "query.media_source": {
+                    "description": "可选元数据源列表；为空时使用 MoviePilot 默认来源。仅传递 MoviePilot 支持或已配置的来源标识。",
+                    "examples": [
+                        "themoviedb", "douban", "bangumi", "anilist", "imdb", "tvdb",
+                        "musicbrainz", "theaudiodb", "doubanmusic",
+                    ],
+                },
+                "query.music_type": {
+                    "allowed_values": ["recording", "album", "artist"],
+                    "only_when": "query.type 为 music 或选择了音乐元数据源时。",
+                },
+            },
+            "output_contract": {
+                "kind": "media_candidate_list",
+                "data_shape": "list",
+                "description": "返回候选列表；从候选结果中选择服务端返回的媒体身份后，再进行详情、订阅或下载等后续操作。",
+                "result_count_field": "collection.result_count",
+            },
+        },
+        "media.recognize": {
+            "purpose": "根据标题、副标题和临时识别词解析一个最匹配的媒体身份，返回媒体上下文。",
+            "use_when": [
+                "输入是种子标题、文件名、发布标题或包含季集等信息的文本。",
+                "需要先把模糊文本解析成一个标准媒体身份。",
+            ],
+            "do_not_use_when": [
+                "希望浏览或人工选择多个候选媒体；应使用 media.search。",
+                "需要直接搜索站点种子资源；应使用 search.title 等站点搜索 operation。",
+            ],
+            "field_rules": {
+                "query.title": {
+                    "description": "待识别的主标题、种子标题或文件名文本。",
+                },
+                "query.subtitle": {
+                    "description": "可选副标题，用于补充译名、年份、季集或其他识别上下文。",
+                },
+                "query.custom_words": {
+                    "description": "仅本次识别有效的临时识别词或规则；每行一条，不会保存到系统配置。",
+                },
+            },
+            "output_contract": {
+                "kind": "media_context",
+                "data_shape": "object",
+                "description": "返回一个媒体上下文，包含解析后的 meta_info 和匹配到的 media_info；未匹配时对应内容可能为空。",
+                "fields": ["meta_info", "media_info"],
+            },
+        },
+    }
 
     def __init__(self):
         super().__init__()
@@ -147,7 +215,9 @@ class MoviePilotMCP(_PluginBase):
                 "Route to one allowlisted MoviePilot V3 business operation. Choose the exact operation_id "
                 "from the enum, then pass native JSON path_params, query, and body values. The MoviePilot "
                 "server validates the exact per-operation contract and returns input_contract when invalid_input "
-                "needs correction. Never provide a URL, HTTP method, authentication header, or API token."
+                "needs correction. Before calling an unfamiliar operation, call moviepilot_api_describe to learn "
+                "its purpose, valid field values, and result shape. Never provide a URL, HTTP method, authentication "
+                "header, or API token."
             ),
             "properties": {
                 "operation_id": {
@@ -180,8 +250,8 @@ class MoviePilotMCP(_PluginBase):
             "name": cls._operation_contract_tool_name,
             "description": (
                 "Read-only MoviePilot V3 operation contract lookup. Pass one operation_id to get its "
-                "allowed and required arguments before calling moviepilot_api. This tool only describes "
-                "the input contract and never executes a MoviePilot operation."
+                "allowed and required arguments, valid field values, usage boundaries, and result shape before "
+                "calling moviepilot_api. This tool only describes an operation and never executes it."
             ),
             "inputSchema": {
                 "title": cls._operation_contract_tool_name,
@@ -214,6 +284,121 @@ class MoviePilotMCP(_PluginBase):
             if isinstance(schema, dict):
                 return schema
         return None
+
+    @staticmethod
+    def _find_operation_schema_branch(schema: Any, operation_id: str) -> Optional[Dict[str, Any]]:
+        """定位单个 operation 的原始 oneOf 分支。"""
+        if not isinstance(schema, dict):
+            return None
+        for branch in schema.get("oneOf") or []:
+            if not isinstance(branch, dict):
+                continue
+            properties = branch.get("properties")
+            operation = properties.get("operation_id") if isinstance(properties, dict) else None
+            if isinstance(operation, dict) and operation.get("const") == operation_id:
+                return branch
+        return None
+
+    @staticmethod
+    def _operation_purpose(branch: Dict[str, Any], operation_id: str) -> str:
+        """从原始分支说明中提取面向模型的简短用途。"""
+        description = branch.get("description")
+        if not isinstance(description, str) or not description.strip():
+            return f"执行 MoviePilot operation：{operation_id}。"
+        return description.split(" Method:", 1)[0].strip()
+
+    @staticmethod
+    def _operation_effect(branch: Dict[str, Any]) -> Optional[str]:
+        """提取由 V3 原始 operation 分支声明的动作效果。"""
+        description = branch.get("description")
+        if not isinstance(description, str) or " Effect: " not in description:
+            return None
+        effect = description.split(" Effect: ", 1)[1].split(".", 1)[0].strip()
+        return effect or None
+
+    @staticmethod
+    def _generic_output_contract(branch: Dict[str, Any]) -> Dict[str, Any]:
+        """保留原始 Schema 已声明的集合输出元数据，其他 operation 明确标注未知。"""
+        collection = branch.get("x-moviepilot-collection")
+        if isinstance(collection, dict):
+            return {
+                "kind": "collection",
+                "data_shape": collection.get("body_shape") or "list",
+                "pagination": collection.get("default_pagination"),
+                "result_count_field": collection.get("result_count_field"),
+                "total_count_field": collection.get("total_count_field"),
+            }
+        return {
+            "kind": "operation_specific",
+            "available": False,
+            "description": "原始 MCP Schema 未声明机器可读的输出合同；请依据工具实际结果继续处理。",
+        }
+
+    @classmethod
+    def _apply_operation_input_contract_overrides(
+        cls,
+        operation_id: str,
+        contract: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """在不改变服务端合同的前提下，补齐外部 Agent 需要的高频字段值提示。"""
+        contract = deepcopy(contract)
+        override = cls._operation_descriptor_overrides.get(operation_id) or {}
+        field_rules = override.get("field_rules")
+        if not isinstance(field_rules, dict):
+            return contract
+
+        for field_path, rule in field_rules.items():
+            if not isinstance(field_path, str) or not isinstance(rule, dict):
+                continue
+            container_name, separator, field_name = field_path.partition(".")
+            if not separator or container_name not in {"path_params", "query", "body"}:
+                continue
+            container = contract.get(container_name)
+            fields = container.get("fields") if isinstance(container, dict) else None
+            if not isinstance(fields, dict) and isinstance(container, dict):
+                fields = container.get("properties")
+            field = fields.get(field_name) if isinstance(fields, dict) else None
+            if not isinstance(field, dict):
+                continue
+            allowed_values = rule.get("allowed_values")
+            if isinstance(allowed_values, list):
+                field["enum"] = deepcopy(allowed_values)
+                field["one_of"] = [
+                    {"enum": deepcopy(allowed_values), "type": "string"},
+                    *(
+                        [{"type": "null"}]
+                        if any(item.get("type") == "null" for item in field.get("one_of", []) if isinstance(item, dict))
+                        else []
+                    ),
+                ]
+            for key in ("default", "description", "examples", "only_when"):
+                if key in rule:
+                    field[key] = deepcopy(rule[key])
+        return contract
+
+    @classmethod
+    def _get_operation_descriptor(
+        cls,
+        schema: Any,
+        operation_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """组合原始分支元数据和插件语义覆盖，供外部 Agent 在调用前阅读。"""
+        branch = cls._find_operation_schema_branch(schema, operation_id)
+        if branch is None:
+            return None
+
+        descriptor: Dict[str, Any] = {
+            "purpose": cls._operation_purpose(branch, operation_id),
+            "source_description": branch.get("description"),
+            "output_contract": cls._generic_output_contract(branch),
+        }
+        effect = cls._operation_effect(branch)
+        if effect:
+            descriptor["effect"] = effect
+
+        override = deepcopy(cls._operation_descriptor_overrides.get(operation_id) or {})
+        descriptor.update(override)
+        return descriptor
 
     @staticmethod
     def _fallback_operation_input_contract(schema: Any, operation_id: str) -> Dict[str, Any]:
@@ -290,12 +475,15 @@ class MoviePilotMCP(_PluginBase):
                 },
                 True,
             )
+        contract = cls._apply_operation_input_contract_overrides(operation_id, contract)
+        descriptor = cls._get_operation_descriptor(schema, operation_id)
         return (
             {
                 "success": True,
                 "operation_id": operation_id,
                 "input_contract": contract,
-                "next_action": "按 input_contract 组装参数后调用 moviepilot_api。",
+                "operation_descriptor": descriptor,
+                "next_action": "先遵守 operation_descriptor 的用途边界和 field_rules，再按 input_contract 组装参数后调用 moviepilot_api。",
             },
             False,
         )

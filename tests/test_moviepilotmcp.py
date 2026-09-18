@@ -480,6 +480,62 @@ class MoviePilotMCPV3SchemaTest(unittest.TestCase):
         self.assertEqual(result["operation_id"], "subscription.add")
         self.assertEqual(result["input_contract"]["required_arguments"], ["body"])
         self.assertIn("body", result["input_contract"])
+        self.assertIn("purpose", result["operation_descriptor"])
+
+    def test_v3_describe_enriches_media_search_semantics_and_type_values(self):
+        plugin = self.module.MoviePilotMCP()
+        source_schema = {
+            "oneOf": [
+                {
+                    "description": (
+                        "Search canonical media across selected metadata sources. "
+                        "Method: GET. Path: /api/v1/media/search. Effect: safe_read."
+                    ),
+                    "properties": {
+                        "operation_id": {"const": "media.search"},
+                        "query": {
+                            "type": "object",
+                            "properties": {
+                                "title": {"type": "string"},
+                                "type": {
+                                    "anyOf": [{"type": "string"}, {"type": "null"}],
+                                    "default": "media",
+                                },
+                                "media_source": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                            },
+                            "required": ["title"],
+                        },
+                    },
+                    "required": ["operation_id", "query"],
+                    "x-moviepilot-collection": {
+                        "body_shape": "list",
+                        "result_count_field": "collection.result_count",
+                    },
+                }
+            ]
+        }
+
+        payload, is_error = plugin._build_operation_contract_result(
+            source_schema,
+            "media.search",
+        )
+
+        self.assertFalse(is_error)
+        self.assertEqual(
+            payload["input_contract"]["query"]["properties"]["type"]["enum"],
+            ["media", "music", "collection", "person"],
+        )
+        descriptor = payload["operation_descriptor"]
+        self.assertEqual(descriptor["purpose"], "按标题从元数据源搜索候选媒体、音乐、合集或人物，返回候选列表。")
+        self.assertEqual(
+            descriptor["field_rules"]["query.type"]["allowed_values"],
+            ["media", "music", "collection", "person"],
+        )
+        self.assertEqual(descriptor["output_contract"]["kind"], "media_candidate_list")
+        self.assertEqual(descriptor["effect"], "safe_read")
 
     def test_v3_describe_unknown_operation_returns_tool_error(self):
         plugin = self.module.MoviePilotMCP()
