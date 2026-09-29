@@ -44,7 +44,7 @@ class MoviePilotMCP(_PluginBase):
     plugin_name = "MoviePilot MCP Server"
     plugin_desc = "MoviePilot V3 内置 Agent 工具的 MCP 对外暴露层，支持 OAuth 2.0 + PKCE 与资源绑定鉴权；兼容外部客户端的大型工具 Schema"
     plugin_icon = "https://raw.githubusercontent.com/cyt-666/MoviePilot-Plugins/main/icons/moviepilotmcp.svg"
-    plugin_version = "1.2.0"
+    plugin_version = "1.2.1"
     plugin_author = "cyt-666"
     author_url = "https://github.com/cyt-666/MoviePilot-Plugins"
     plugin_config_prefix = "moviepilotmcp_"
@@ -1629,7 +1629,7 @@ class MoviePilotMCP(_PluginBase):
             return self._oauth_redirect_error(
                 redirect_uri=auth_request.redirect_uri,
                 error="access_denied",
-                description="管理员拒绝了本次授权",
+                description="authorization denied by administrator",
                 state=auth_request.state,
             )
 
@@ -1794,7 +1794,7 @@ class MoviePilotMCP(_PluginBase):
                     status_code=401,
                     detail="访问令牌无效",
                     headers=self._challenge_headers(
-                        error="invalid_token", description="access token 无效"
+                        error="invalid_token", description="access token is invalid"
                     ),
                 )
             if access_info.get("expires_at", 0) < self._now():
@@ -1804,7 +1804,7 @@ class MoviePilotMCP(_PluginBase):
                     status_code=401,
                     detail="访问令牌已过期",
                     headers=self._challenge_headers(
-                        error="invalid_token", description="access token 已过期"
+                        error="invalid_token", description="access token has expired"
                     ),
                 )
 
@@ -1816,7 +1816,7 @@ class MoviePilotMCP(_PluginBase):
                     status_code=401,
                     detail="访问令牌的 resource 不匹配",
                     headers=self._challenge_headers(
-                        error="invalid_token", description="access token resource 不匹配"
+                        error="invalid_token", description="access token resource mismatch"
                     ),
                 )
 
@@ -2165,7 +2165,14 @@ class MoviePilotMCP(_PluginBase):
             parts.append(
                 f'error_description="{self._escape_auth_header(description)}"'
             )
-        return {"WWW-Authenticate": ", ".join(parts)}
+        header_value = ", ".join(parts)
+        try:
+            header_value.encode("latin-1")
+        except UnicodeEncodeError:
+            # HTTP 头只允许 latin-1（RFC 7230）；非 ASCII 转义为 \uXXXX，
+            # 避免 401 鉴权挑战被渲染成 500
+            header_value = header_value.encode("unicode_escape").decode("ascii")
+        return {"WWW-Authenticate": header_value}
 
     def _get_logged_in_admin(self, request: Request) -> Optional[Dict[str, Any]]:
         """
